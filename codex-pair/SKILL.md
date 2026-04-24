@@ -203,10 +203,16 @@ activate. Using Phase 1 fallback for this turn." Then proceed with 3B.
 
 ## Step 3A — Phase 5: push model via tmux-bridge MCP
 
-### 3A.1 — Bootstrap Codex on the first spawn
+### 3A.1 — Bootstrap Codex (always, on Phase 5 path)
 
-**Only run this block if `FRESH_SPAWN=1` from Step 1.** A reused pane has
-already been bootstrapped; re-running it would waste a Codex turn.
+**Run this block every time the Phase 5 path is taken, regardless of
+`FRESH_SPAWN`.** A reused Codex pane may predate Codex's own MCP-loading
+restart — it would have bridge tools unavailable even though CC has
+them. Cheapest fix: always re-run the bootstrap and let it be a no-op
+when Codex is already set up. Phrase the preamble so Codex skips
+observable actions when already bootstrapped (the `tmux_name` calls are
+idempotent; re-reading the contract costs ~1 Codex turn but is safe).
+Credit: Codex review 2026-04-24 Part B #2 / HIGH.
 
 The Codex pane needs to know:
 - It has `tmux-bridge` MCP tools available (Codex loaded the same server).

@@ -18,7 +18,7 @@ subsequent Phase-5 dev work.
 | 10 | MEDIUM | Error-handling section overpromises auth-error detection the steps never perform | PARTIAL — docs trimmed; auth-error probe still unimplemented |
 | 11 | MEDIUM | Auto-edit of `.gitignore` during consult dirties the worktree without consent | **PARTIAL** — now only edits when we're in a git repo AND a `.gitignore` already exists (doesn't create one). Still auto-edits without opt-in flag |
 | 12 | MEDIUM | Phase 5 push model assumes CC is idle; injected text can collide with mid-turn CC | OPEN — needs handoff/mailbox design thinking |
-| 13 | LOW | Phase 5 bootstrap hardcodes `/Users/ryoung/...` bridge path | **FIXED** — bootstrap preamble now references `~/.claude/skills/codex-pair/vendor/...` |
+| 13 | LOW | Phase 5 bootstrap hardcodes `/Users/ryoung/...` bridge path | **PARTIAL** — machine-specific path removed; still hardcodes vendor/ layout while install.sh supports three (vendor/, dev-layout/, --bridge-path). Codex Part A flagged that prior "FIXED" status was overstated |
 | 14 | LOW | Setup story contradicts itself (Phase 1 says no MCP needed; first-time setup says install bridge) | **FIXED** — First-time setup now explicitly scoped to Phase 5 transport; Phase 1 works without the bridge |
 | 5b | — | Sentinel token too long — wraps in narrow Codex panes, defeating `grep -F` | **FIXED** — sentinel is now `§cx:<8hex>:E§` (≤20 chars) |
 
@@ -56,6 +56,30 @@ sentinel extraction, no scrollback polling, no session-resume gymnastics.
 Prioritize fixing the OPEN items that *aren't* made irrelevant by Phase 5:
 **2 (serialization), 3 (readiness), 9 (readiness sleep), 12 (push
 race)**.
+
+## Phase 5 review findings (Codex, 2026-04-24, second pass)
+
+Codex was asked to verify the iteration-2 fixes and find new Phase-5
+issues. Fifteen total findings; status below.
+
+### New Phase 5 issues (SKILL.md)
+
+| # | Severity | Summary | Status |
+|---|---|---|---|
+| P5-1 | HIGH | Transport selection keys off exact tool names via ToolSearch; namespace drift (`tmux-bridge` vs `tmux_bridge`) misroutes | OPEN — needs more tolerant detection (e.g. match any `*tmux*bridge*` tool) |
+| P5-2 | HIGH | Reused Codex pane can predate Codex's own MCP-load restart; skill takes Phase 5 path, skips bootstrap because `FRESH_SPAWN=0`, Codex then has no tools to reply with | **FIXED** — bootstrap now runs on every Phase 5 invocation regardless of `FRESH_SPAWN`; preamble is idempotent |
+| P5-3 | HIGH | Bootstrap success assumed, not verified. After `sleep 5`, addressing `target="codex"` fails silently if Codex ignored the preamble | OPEN — needs a `tmux_resolve("codex")` post-bootstrap check with fallback to raw pane ID |
+| P5-4 | HIGH | Reply handling discards the `id:<uuid>` correlation ID in the bridge header; concurrent asks or unsolicited Codex pushes misattribute | OPEN — needs pending-request registry (design work, not a one-line fix) |
+| P5-5 | MEDIUM | Labels `codex`/`claude` are global — multiple pair sessions on one tmux server cross-wire | OPEN — scope labels by window_id or session_id (e.g. `codex-@3`) |
+
+### New install.sh issues
+
+| # | Severity | Summary | Status |
+|---|---|---|---|
+| I-1 | HIGH | Non-global CC registration writes to the wrong settings file. `SCRIPT_DIR/../../..` from the installed-skill location resolves to `$HOME`, so "project-local" = `$HOME/.claude/settings.local.json`, not the caller's actual project | **FIXED** — `PROJECT_ROOT` now resolved from `git rev-parse --show-toplevel` of the user's cwd, falling back to `pwd` |
+| I-2 | MEDIUM | `--dry-run --skip-build` emits false "MCP won't start" warning for a file that was intentionally not built | **FIXED** — warning now only fires when `DRY_RUN=0` |
+| I-3 | MEDIUM | `applyDefaults()` regex still format-fragile (single-line, semicolon-terminated). Multi-line upstream reformat would silently disable self-heal | OPEN — lower priority; upstream bridge is unlikely to reformat |
+| I-4 | LOW | Auto-clone suppressed git's stderr; bare "CLONE FAILED" gave no actionable diagnosis | **FIXED** — stderr now flows through; user sees the actual git error |
 
 ## Still true: Codex's assumption from the review
 

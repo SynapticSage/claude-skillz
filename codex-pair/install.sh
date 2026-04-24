@@ -105,8 +105,13 @@ BRIDGE_ENTRY="$BRIDGE_PATH/dist/index.js"
 if [[ $GLOBAL_CC -eq 1 ]]; then
   CC_SETTINGS="$HOME/.claude/settings.json"
 else
-  # Project-local: ascend until we find a .claude dir or hit filesystem root.
-  PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+  # Project-local. Resolve from the user's cwd (where install.sh was
+  # invoked), NOT from SCRIPT_DIR — once the skill is installed globally
+  # at ~/.claude/skills/codex-pair/, SCRIPT_DIR/../../.. resolves to
+  # $HOME, which would write to ~/.claude/settings.local.json (a real
+  # file, but not the project the caller is in). Credit: Codex review
+  # 2026-04-24 Part C #1 / HIGH.
+  PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   CC_SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
 fi
 
@@ -204,12 +209,16 @@ if [[ ! -d "$BRIDGE_PATH" ]]; then
     say "  → $BRIDGE_PATH"
     if [[ $DRY_RUN -eq 0 ]]; then
       mkdir -p "$(dirname "$BRIDGE_PATH")"
-      if git clone --depth 1 "$BRIDGE_REPO" "$BRIDGE_PATH" >/dev/null 2>&1; then
+      # Don't suppress git's stderr — if the clone fails, the user needs
+      # to see the actual error (auth, network, disk full, etc.). A bare
+      # "CLONE FAILED" with no diagnosis is useless. Credit: Codex review
+      # 2026-04-24 Part C #4 / LOW.
+      if git clone --depth 1 "$BRIDGE_REPO" "$BRIDGE_PATH"; then
         BRIDGE_PATH="$(cd "$BRIDGE_PATH" && pwd)"
         BRIDGE_ENTRY="$BRIDGE_PATH/dist/index.js"
         say "  cloned"
       else
-        say "  CLONE FAILED"
+        say "  CLONE FAILED (see git error above)"
         FAIL=1
       fi
     else
@@ -335,7 +344,10 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   say ""
 else
   say "=== Skipping build (--skip-build) ==="
-  if [[ ! -f "$BRIDGE_ENTRY" ]]; then
+  # Suppress the "doesn't exist" warning in --dry-run, since dry-run may
+  # have skipped the clone step too. Only warn when we expected the file
+  # to be there. Credit: Codex review 2026-04-24 Part C #2 / MEDIUM.
+  if [[ $DRY_RUN -eq 0 && ! -f "$BRIDGE_ENTRY" ]]; then
     say "WARNING: $BRIDGE_ENTRY does not exist. MCP won't start."
   fi
   say ""
