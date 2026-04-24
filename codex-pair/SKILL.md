@@ -301,25 +301,51 @@ activate. Using Phase 1 fallback for this turn." Then proceed with 3B.
 
 ## Step 3A — Phase 5: push model via tmux-bridge MCP
 
-### 3A.1 — Bootstrap Codex (always, on Phase 5 path)
+### 3A.1 — Bootstrap Codex (always, on Phase 5 path) with verified ACK
 
 **Run this block every time the Phase 5 path is taken, regardless of
-`FRESH_SPAWN`.** A reused Codex pane may predate Codex's own MCP-loading
+`FRESH_SPAWN`.** A reused Codex pane may predate Codex's own MCP-load
 restart — it would have bridge tools unavailable even though CC has
 them. Cheapest fix: always re-run the bootstrap and let it be a no-op
-when Codex is already set up. Phrase the preamble so Codex skips
-observable actions when already bootstrapped (the `tmux_name` calls are
-idempotent; re-reading the contract costs ~1 Codex turn but is safe).
+when Codex is already set up. The preamble's actions are idempotent.
 Credit: Codex review 2026-04-24 Part B #2 / HIGH.
 
-The Codex pane needs to know:
-- It has `tmux-bridge` MCP tools available (Codex loaded the same server).
-- The CC pane's ID and label.
-- The contract rules (read before act, don't poll, push replies via
-  `tmux_message`).
+#### 3A.1.a — Skip if recent ACK exists
 
-Build a bootstrap message and send it via bracketed paste (same mechanism
-as Phase 1 — see Step 3B.1), then Enter:
+Check `$SESSION_DIR/bootstrap.json` first. If present, fresh (≤5 min
+old), and validates against the four predicates (see 3A.1.c), skip
+the bootstrap and go straight to 3A.2 — Codex is already prepared.
+
+```bash
+set -euo pipefail
+TMUX_BIN=/opt/homebrew/bin/tmux
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+BFILE="$SESSION_DIR/bootstrap.json"
+
+SKIP_BOOTSTRAP=0
+if [ -f "$BFILE" ]; then
+  AGE_S=$(( $(date +%s) - $(stat -f %m "$BFILE") ))
+  [ "$AGE_S" -lt 300 ] && SKIP_BOOTSTRAP=1
+fi
+echo "SKIP_BOOTSTRAP=$SKIP_BOOTSTRAP"
+```
+
+If `SKIP_BOOTSTRAP=1`, jump to 3A.2.
+
+#### 3A.1.b — Compose and deliver the bootstrap preamble
+
+Generate a `BOOTSTRAP_UUID` (8-hex), then compose the preamble Codex
+must read. The preamble instructs Codex to:
+1. Run a bridge self-test (`tmux_id()` + `tmux_doctor()`) to prove the
+   MCP layer is functional from its side.
+2. Write `bootstrap.json` via temp-file + atomic rename (so CC's
+   reader never sees a partial write).
+
+Send via bracketed paste (same mechanism as Phase 1 — see Step 3B.1),
+then Enter. Substitute `<CC_PANE>`, `<BOOTSTRAP_UUID>`, `<SESSION_DIR>`
+with concrete values from this turn:
 
 ```
 You are paired with Claude Code in tmux pane <CC_PANE>.
@@ -350,18 +376,139 @@ CORRELATION (important):
   pending request and will treat your message as unsolicited or as a
   protocol violation.
 
+BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
+  Confirm setup by running a bridge self-test and writing a file Claude
+  will poll for. This proves your MCP tools work end-to-end.
+
+  Step 1: Get your own pane ID via the bridge:
+        my_pane = tmux_id()
+  Step 2: Run the bridge diagnostic:
+        doctor = tmux_doctor()
+  Step 3: Write bootstrap.json via a temp-file + atomic rename so
+          Claude does not see a partial file. Use bash through your
+          Read/Write/Bash tools:
+
+        TMPF="<SESSION_DIR>/bootstrap.json.tmp"
+        FINAL="<SESSION_DIR>/bootstrap.json"
+        cat > "$TMPF" <<'JSON'
+        {
+          "acked": true,
+          "bootstrap_id": "<BOOTSTRAP_UUID>",
+          "codex_pane_id": "<my_pane from step 1>",
+          "doctor_status": "<full output of doctor from step 2>",
+          "ts": "<current ISO 8601 UTC, e.g. 2026-04-24T15:30:00Z>"
+        }
+        JSON
+        mv "$TMPF" "$FINAL"
+
+  Do this BEFORE acknowledging via tmux_message or waiting for input.
+  The file write IS the acknowledgement. Do not use tmux_message for
+  the ACK — Claude waits on the file, not a message.
+
 Upstream full contract:
   cat ~/.claude/skills/codex-pair/vendor/tmux-bridge-mcp/system-instruction/smux-skill.md
 
-Wait for the user's actual prompt in the next message.
+Wait for the user's actual prompt in the next message (it will arrive
+via tmux_message and contain a [req:<uuid>] tag).
 ```
 
-Substitute `<CC_PANE>` with the value from Step 1. Deliver this block via
-the bracketed-paste mechanism in Step 3B.1 below (yes, we use Phase 1
-mechanics to bootstrap Phase 5 — this is the one thing we can't do via
-MCP on first spawn because Codex hasn't been told about the bridge yet).
-After sending, wait ~5s for Codex to register the labels, then proceed
-to 3A.2.
+Substitute `<CC_PANE>`, `<BOOTSTRAP_UUID>`, `<SESSION_DIR>` with their
+values, then deliver via the bracketed-paste mechanism in Step 3B.1
+below (yes, we use Phase 1 mechanics to bootstrap Phase 5 — this is
+the one thing we can't do via MCP on first spawn because Codex hasn't
+been told about the bridge yet).
+
+#### 3A.1.c — Verify the ACK (4-predicate file check)
+
+After sending the preamble + Enter, CC polls `bootstrap.json` for up
+to 90 seconds. The file presence is necessary but not sufficient:
+validate four predicates before treating the bootstrap as confirmed.
+
+```bash
+set -euo pipefail
+TMUX_BIN=/opt/homebrew/bin/tmux
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+BFILE="$SESSION_DIR/bootstrap.json"
+
+# $BOOTSTRAP_UUID and $CODEX_PANE_ID set in 3A.1.b
+DEADLINE=$(( $(date +%s) + 90 ))
+ACK_OK=0
+
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  if [ -f "$BFILE" ]; then
+    # Tolerate transient parse errors — Codex might still be writing,
+    # though atomic rename in the preamble should prevent this. Belt
+    # and suspenders.
+    RESULT=$(python3 - "$BFILE" "$BOOTSTRAP_UUID" "$CODEX_PANE_ID" <<'PY'
+import json, sys, datetime
+path, want_uuid, want_pane = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f: d = json.load(f)
+except (json.JSONDecodeError, IOError):
+    print("RETRY"); sys.exit(0)
+
+# Predicate 1: bootstrap_id matches what we sent
+if d.get("bootstrap_id") != want_uuid:
+    print(f"FAIL bootstrap_id_mismatch want={want_uuid} got={d.get('bootstrap_id')}")
+    sys.exit(0)
+# Predicate 2: codex_pane_id == the pane we spawned (proves tmux_id works)
+if d.get("codex_pane_id") != want_pane:
+    print(f"FAIL codex_pane_id_mismatch want={want_pane} got={d.get('codex_pane_id')}")
+    sys.exit(0)
+# Predicate 3: doctor_status contains "Status: OK" (proves tmux_doctor works)
+if "Status: OK" not in d.get("doctor_status", ""):
+    print(f"FAIL doctor_unhealthy: {d.get('doctor_status', '<missing>')[:200]}")
+    sys.exit(0)
+# Predicate 4: ts parses and is within last 5 min
+try:
+    ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")
+    age = (datetime.datetime.utcnow() - ts).total_seconds()
+    if age > 300 or age < -60:  # tolerate small clock skew
+        print(f"FAIL ts_stale age={age:.0f}s")
+        sys.exit(0)
+except Exception as e:
+    print(f"FAIL ts_unparseable: {e}")
+    sys.exit(0)
+print("OK")
+PY
+)
+    case "$RESULT" in
+      OK)         ACK_OK=1; break ;;
+      RETRY)      ;;  # transient — keep polling
+      FAIL*)      echo "ACK_INVALID: $RESULT"; break ;;
+    esac
+  fi
+  sleep 3
+done
+
+[ "$ACK_OK" -eq 1 ] && echo "BOOTSTRAP_ACKED" || echo "BOOTSTRAP_TIMEOUT"
+```
+
+#### 3A.1.d — Outcome handling
+
+- **`BOOTSTRAP_ACKED`** → proceed to 3A.2.
+- **`ACK_INVALID: FAIL <reason>`** → bootstrap is broken in a known
+  way. Surface the reason to the user verbatim, fail the turn cleanly.
+  User can `/codex-pair --rebootstrap` to retry.
+- **`BOOTSTRAP_TIMEOUT`** → no `bootstrap.json` (or no valid one) within
+  90s. Codex didn't run the self-test, or the bridge isn't loaded on
+  Codex's side, or Codex is in trust-prompt / approval-modal state.
+  Surface to the user: "Codex bootstrap timed out. Open pane
+  `$CODEX_PANE_ID` to check. Retry with `/codex-pair --rebootstrap`,
+  or fall back with `/codex-pair --phase1 <prompt>`." Fail the turn.
+
+**Never** silently fall back to Phase 1 mid-turn after the bootstrap
+preamble has already been sent (per Codex review 2026-04-24 finding
+#6 and v3 plan condition #2). The user's `/codex-pair --phase1`
+opt-in is the correct path for forcing Phase 1.
+
+After successful ACK, write a copy of `bootstrap.json` to itself with
+`mtime` refreshed (effectively `touch`) so the 5-min skip-check in
+3A.1.a sees it as recent on the next invocation. The atomic rename
+already gave it the right ts — no further action needed; the timestamp
+is what 3A.1.a uses.
 
 ### 3A.2 — Deliver the user's prompt via MCP
 
