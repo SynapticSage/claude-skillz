@@ -66,11 +66,11 @@ issues. Fifteen total findings; status below.
 
 | # | Severity | Summary | Status |
 |---|---|---|---|
-| P5-1 | HIGH | Transport selection keys off exact tool names via ToolSearch; namespace drift (`tmux-bridge` vs `tmux_bridge`) misroutes | OPEN — needs more tolerant detection (e.g. match any `*tmux*bridge*` tool) |
-| P5-2 | HIGH | Reused Codex pane can predate Codex's own MCP-load restart; skill takes Phase 5 path, skips bootstrap because `FRESH_SPAWN=0`, Codex then has no tools to reply with | **FIXED** — bootstrap now runs on every Phase 5 invocation regardless of `FRESH_SPAWN`; preamble is idempotent |
-| P5-3 | HIGH | Bootstrap success assumed, not verified. After `sleep 5`, addressing `target="codex"` fails silently if Codex ignored the preamble | OPEN — needs a `tmux_resolve("codex")` post-bootstrap check with fallback to raw pane ID |
-| P5-4 | HIGH | Reply handling discards the `id:<uuid>` correlation ID in the bridge header; concurrent asks or unsolicited Codex pushes misattribute | OPEN — needs pending-request registry (design work, not a one-line fix) |
-| P5-5 | MEDIUM | Labels `codex`/`claude` are global — multiple pair sessions on one tmux server cross-wire | OPEN — scope labels by window_id or session_id (e.g. `codex-@3`) |
+| P5-1 | HIGH | Transport selection keys off exact tool names via ToolSearch; namespace drift (`tmux-bridge` vs `tmux_bridge`) misroutes | OPEN — needs more tolerant detection |
+| P5-2 | HIGH | Reused Codex pane can predate Codex's own MCP-load restart; skill takes Phase 5 path, skips bootstrap because `FRESH_SPAWN=0`, Codex then has no tools to reply with | **FIXED** (commit 1/4) — bootstrap now runs on every Phase 5 invocation; preamble is idempotent |
+| P5-3 | HIGH | Bootstrap success assumed, not verified | **FIXED** (commit 3/4) — file-based ACK with 4-predicate validation: `bootstrap_id` matches sent UUID, `codex_pane_id` from `tmux_id()` matches spawned pane, `doctor_status` from `tmux_doctor()` contains `Status: OK`, `ts` parses as fresh ISO 8601. Atomic temp-file + rename prevents partial-read race. Failure modes split between ACK_INVALID (specific reason) and BOOTSTRAP_TIMEOUT |
+| P5-4 | HIGH | Reply handling discards correlation; concurrent asks misattribute | **FIXED** (commit 2/4) — req-id round-tripping with `[req:<uuid>]` / `[reply-to:<uuid>]` tags; three-predicate validation (tag present, pending file exists, pane:%N matches stored codex_pane); health tracking with consecutive-misses counter. Pending state stored as `pending/<req-id>.json`, single-flight enforced as policy by Step 0.5 gate |
+| P5-5 | MEDIUM | Labels global; multiple pair sessions cross-wire | **FIXED** (commits 1+4) — routing now uses pane IDs (`%N`), not labels. Labels are still set via `tmux_name` (commit 4 in 3A.1) but only for the human-visible tmux border, scoped as `codex-<WINDOW_ID>` / `claude-<WINDOW_ID>`. Cross-wiring impossible because labels aren't load-bearing |
 
 ### New install.sh issues
 

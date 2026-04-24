@@ -405,6 +405,22 @@ BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
   The file write IS the acknowledgement. Do not use tmux_message for
   the ACK — Claude waits on the file, not a message.
 
+LABELING (cosmetic only, do this AFTER the bootstrap ACK is written):
+  After writing bootstrap.json, label both panes for human visibility
+  in the tmux pane border. These labels are NOT used for routing —
+  Claude addresses you by raw pane ID (%N) — but they make the border
+  more readable when you have multiple agent panes open:
+
+        tmux_read(target=tmux_id())   # satisfy read-guard
+        tmux_name(target=tmux_id(), label="codex-<WINDOW_ID>")
+        tmux_read(target="<CC_PANE>")
+        tmux_name(target="<CC_PANE>", label="claude-<WINDOW_ID>")
+
+  Window-scoped labels avoid collisions when more than one /codex-pair
+  session runs on the same tmux server. If labeling fails (read-guard
+  rejects, etc.), it does not block anything — Claude doesn't depend on
+  labels.
+
 Upstream full contract:
   cat ~/.claude/skills/codex-pair/vendor/tmux-bridge-mcp/system-instruction/smux-skill.md
 
