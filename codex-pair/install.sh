@@ -72,11 +72,27 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Skill lives at <repo>/.claude/skills/codex/install.sh
-# Bridge lives at <repo>/repos/tmux-bridge-mcp/ in the default dev layout.
-# Go up three dirs to reach <repo>.
-DEFAULT_BRIDGE="$SCRIPT_DIR/../../../repos/tmux-bridge-mcp"
-BRIDGE_PATH="${BRIDGE_PATH:-$DEFAULT_BRIDGE}"
+# Resolve the bridge location. The skill supports two canonical install
+# layouts, checked in order:
+#   1. <skill-dir>/vendor/tmux-bridge-mcp/   — vendored alongside the skill
+#      (recommended once you've promoted the skill to ~/.claude/skills/).
+#   2. <skill-dir>/../../../repos/tmux-bridge-mcp/  — dev layout for when
+#      the skill still lives inside tmux-manage/.claude/skills/.
+# If neither exists and --no-auto-clone wasn't set, auto-clone target is (1).
+# Users can always override with --bridge-path.
+if [[ -z "$BRIDGE_PATH" ]]; then
+  CANDIDATE_VENDOR="$SCRIPT_DIR/vendor/tmux-bridge-mcp"
+  CANDIDATE_DEV="$SCRIPT_DIR/../../../repos/tmux-bridge-mcp"
+  if [[ -d "$CANDIDATE_VENDOR" ]]; then
+    BRIDGE_PATH="$CANDIDATE_VENDOR"
+  elif [[ -d "$CANDIDATE_DEV" ]]; then
+    BRIDGE_PATH="$CANDIDATE_DEV"
+  else
+    # Neither exists — default to the vendor location so auto-clone lands
+    # it inside the skill directory (portable across machines).
+    BRIDGE_PATH="$CANDIDATE_VENDOR"
+  fi
+fi
 
 # Canonicalize (if dir exists)
 if [[ -d "$BRIDGE_PATH" ]]; then
@@ -258,9 +274,10 @@ if read_pat.search(content):
     applied.append("tmux_read lines.max(1000)")
 
 # Patch E: neuter bridge.applyDefaults(). Match uncommented form only so
-# re-runs don't double-comment.
+# re-runs don't double-comment. Use [^\n]* instead of [^)]* because the
+# catch body contains paren pairs (() => {}), which [^)]* can't span.
 ap_pat = re.compile(
-    r'^(\s+)(bridge\.applyDefaults\(\)\.catch\([^)]*\)\);)\s*$',
+    r'^(\s+)(bridge\.applyDefaults\(\)[^\n]*;)\s*$',
     re.MULTILINE,
 )
 m = ap_pat.search(content)
@@ -295,18 +312,27 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   say "=== Building tmux-bridge-mcp ==="
   say "Path: $BRIDGE_PATH"
 
-  (
-    cd "$BRIDGE_PATH"
-    # --ignore-scripts blocks postinstall hooks from transitive deps
-    run npm install --no-audit --no-fund --ignore-scripts
-    run npm run build
-  )
-
-  if [[ $DRY_RUN -eq 0 && ! -f "$BRIDGE_ENTRY" ]]; then
-    say "BUILD FAILED: expected $BRIDGE_ENTRY but it doesn't exist"
-    exit 1
+  if [[ ! -d "$BRIDGE_PATH" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      say "  [dry-run] would build at $BRIDGE_PATH (after clone completes)"
+    else
+      say "ERROR: bridge directory $BRIDGE_PATH missing; cannot build"
+      exit 1
+    fi
+  else
+    (
+      cd "$BRIDGE_PATH"
+      # --ignore-scripts blocks postinstall hooks from transitive deps
+      run npm install --no-audit --no-fund --ignore-scripts
+      run npm run build
+    )
+    if [[ $DRY_RUN -eq 0 && ! -f "$BRIDGE_ENTRY" ]]; then
+      say "BUILD FAILED: expected $BRIDGE_ENTRY but it doesn't exist"
+      exit 1
+    fi
+    say "Built: $BRIDGE_ENTRY"
   fi
-  say "Built: $BRIDGE_ENTRY"; say ""
+  say ""
 else
   say "=== Skipping build (--skip-build) ==="
   if [[ ! -f "$BRIDGE_ENTRY" ]]; then
