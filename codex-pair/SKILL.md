@@ -79,7 +79,15 @@ fi
 # Anchor state to the repo root so .context/ doesn't fragment across
 # subdirectory invocations. Fall back to CWD if we're not in a repo.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-mkdir -p "$REPO_ROOT/.context"
+
+# Per-window state directory. Multiple /codex-pair sessions in different
+# tmux windows of the same repo each get their own state dir, keyed by
+# tmux window_id (e.g. @5). Without this scoping, concurrent windows
+# stomp on the same pane-id/lock/pending files. Window IDs are stable
+# within a tmux server lifetime.
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+mkdir -p "$SESSION_DIR/pending"
 
 # Add .context/ to .gitignore if we're in a git repo AND a .gitignore
 # already exists. Skip if .gitignore is absent — creating one is a
@@ -93,22 +101,23 @@ if [ -d "$REPO_ROOT/.git" ] && [ -f "$REPO_ROOT/.gitignore" ] \
   } >> "$REPO_ROOT/.gitignore"
 fi
 
-echo "OK: codex=$CODEX_BIN tmux=$TMUX_BIN repo_root=$REPO_ROOT"
+echo "OK: codex=$CODEX_BIN tmux=$TMUX_BIN repo_root=$REPO_ROOT window=$WINDOW_ID session_dir=$SESSION_DIR"
 ```
 
 If output starts with `MISSING:`, stop and relay the message to the user.
 Do not proceed to Step 1.
 
-The variables `TMUX_BIN`, `CODEX_BIN`, and `REPO_ROOT` are used in every
-subsequent bash block — re-declare them at the top of each block (each
-bash call is a separate subshell and does not inherit these).
+The variables `TMUX_BIN`, `CODEX_BIN`, `REPO_ROOT`, `WINDOW_ID`, and
+`SESSION_DIR` are used in every subsequent bash block — re-declare them
+at the top of each block (each bash call is a separate subshell and
+does not inherit these).
 
 ---
 
 ## Step 1: Attach to or spawn the Codex pane
 
 The Codex pane is the long-running resource. We cache its pane ID in
-`$REPO_ROOT/.context/codex-pane-id`. On each invocation:
+`$SESSION_DIR/pane-id` (per-window). On each invocation:
 
 1. If the cache file exists, verify the pane is still alive.
 2. If alive, reuse it (this is the common path).
@@ -119,8 +128,10 @@ set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 CODEX_BIN=$(command -v codex)
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 
-PANE_FILE="$REPO_ROOT/.context/codex-pane-id"
+PANE_FILE="$SESSION_DIR/pane-id"
 CC_PANE="$TMUX_PANE"   # the pane CC is running in — split-window targets this
 
 CODEX_PANE=""
@@ -150,7 +161,7 @@ if [ -z "$CODEX_PANE" ]; then
   sleep 4
 fi
 
-echo "$FRESH_SPAWN" > "$REPO_ROOT/.context/codex-fresh-spawn"
+echo "$FRESH_SPAWN" > "$SESSION_DIR/fresh-spawn"
 echo "CODEX_PANE=$CODEX_PANE FRESH_SPAWN=$FRESH_SPAWN"
 ```
 
@@ -264,27 +275,38 @@ to 3A.2.
 ### 3A.2 — Deliver the user's prompt via MCP
 
 Now use the bridge tools directly. This is where Phase 5 pays off — no
-sentinels, no polling, no scrollback parsing:
+sentinels, no polling, no scrollback parsing.
 
-1. **Verify the Codex pane by label:**
-   - Call `tmux_list()` and confirm a pane labeled `codex` exists.
+**All routing uses raw pane IDs (`%N`), not labels.** Pane IDs are
+globally unique within a tmux server, always present in the bridge's
+sender-identity header, and never collide. Labels are set elsewhere
+(Step 3A.1) but only for the human-visible tmux pane border — they are
+never used as the `target=` argument to bridge tools. This means the
+skill keeps working even if labels get clobbered, ignored, or
+collide. Substitute `$CODEX_PANE_ID` below with the actual pane ID
+captured in Step 1 (e.g. `%99`).
+
+1. **Verify the Codex pane is still present:**
+   - Call `tmux_list()` and confirm an entry whose `target` matches
+     `$CODEX_PANE_ID`. If absent, fall through to error handling — the
+     pane died between Step 1 and now (rare but possible).
 2. **Read Codex's pane to satisfy the bridge's read-before-act guard:**
-   - Call `tmux_read(target="codex", lines=20)`.
+   - Call `tmux_read(target=$CODEX_PANE_ID, lines=20)`.
 3. **Send the prompt with sender-identity prefix auto-attached:**
-   - Call `tmux_message(target="codex", text=PROMPT_TEXT)`.
+   - Call `tmux_message(target=$CODEX_PANE_ID, text=PROMPT_TEXT)`.
 4. **Re-read to verify the text landed in Codex's input buffer:**
-   - Call `tmux_read(target="codex", lines=5)`.
+   - Call `tmux_read(target=$CODEX_PANE_ID, lines=5)`.
 5. **Submit:**
-   - Call `tmux_keys(target="codex", keys=["Enter"])`.
+   - Call `tmux_keys(target=$CODEX_PANE_ID, keys=["Enter"])`.
 6. **Stop.** End CC's turn with a short message to the user:
-   > "Delivered your prompt to Codex (pane `<CODEX_PANE>`). Codex will
-   > push its reply here when done — typically 30s–3min depending on the
-   > prompt complexity."
+   > "Delivered your prompt to Codex (pane `$CODEX_PANE_ID`). Codex
+   > will push its reply here when done — typically 30s–3min depending
+   > on the prompt complexity."
 
-Do **NOT** poll `tmux_read(target="codex")` in a loop waiting for the
-response. That violates rule 3 of the bridge contract. Codex will
-deliver its response by calling `tmux_message(target="claude", ...)`,
-which arrives in a new CC turn as user input.
+Do **NOT** poll `tmux_read(target=$CODEX_PANE_ID)` in a loop waiting
+for the response. That violates rule 3 of the bridge contract. Codex
+will deliver its response by calling `tmux_message(target=<CC_PANE>,
+...)`, which arrives in a new CC turn as user input.
 
 ### 3A.3 — Handle Codex's pushed reply (on a future CC turn)
 
@@ -309,7 +331,9 @@ Use this path when MCP tools aren't available.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-CODEX_PANE=$(cat "$REPO_ROOT/.context/codex-pane-id")
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
 
 # Short sentinels — must NOT wrap in a narrow Codex TUI. Full UUIDs wrap
 # in panes under ~45 columns, breaking grep -F. An 8-hex slice keeps the
@@ -360,7 +384,9 @@ them.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-CODEX_PANE=$(cat "$REPO_ROOT/.context/codex-pane-id")
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
 # $END is the sentinel from 3B.1
 
 DEADLINE=$(( $(date +%s) + 300 ))
@@ -511,16 +537,31 @@ if the bridge updates upstream.
    replaces bare `tmux` with a function that isn't defined in
    subshells — bare `tmux` calls fail silently. Same rationale for
    `codex` in subshells where PATH differs.
-4. **Always anchor state to `$REPO_ROOT`** (from
-   `git rev-parse --show-toplevel`, falling back to `pwd`). Relative
-   `.context/` paths fragment when the skill is invoked from a
-   subdirectory.
-5. **Use bracketed paste (`load-buffer` + `paste-buffer -p`) for
+4. **Always anchor state to `$SESSION_DIR`**, which is
+   `$REPO_ROOT/.context/codex-pair/$WINDOW_ID/`. `REPO_ROOT` comes
+   from `git rev-parse --show-toplevel` (falls back to `pwd`).
+   `WINDOW_ID` is from `tmux display-message -p '#{window_id}'`.
+   This per-window scoping prevents two `/codex-pair` sessions in
+   different tmux windows of the same repo from stomping each
+   other's pane-id, lock, and pending state. Relative `.context/`
+   paths fragment when the skill is invoked from a subdirectory;
+   the absolute resolution avoids that.
+
+5. **Routing uses pane IDs (`%N`), not labels.** Every call to
+   `tmux_message`, `tmux_read`, `tmux_keys`, etc. uses the raw pane
+   ID captured in Step 1 as the `target=` argument. Labels are set
+   by `tmux_name` (in Step 3A.1 / commit 4) but only for the
+   human-visible tmux pane border — never for routing. Pane IDs
+   are globally unique within a tmux server and always present in
+   the bridge's `[tmux-bridge from:... pane:%N id:...]` header, so
+   matching on them is robust against label collisions, missing
+   labels, or labels Codex never set.
+6. **Use bracketed paste (`load-buffer` + `paste-buffer -p`) for
    multi-line prompt delivery in Phase 1.** Plain `send-keys -l` types
    embedded newlines as Enter keypresses and submits partial prompts.
-6. **In Phase 5, never poll.** Codex pushes responses to CC's pane via
+7. **In Phase 5, never poll.** Codex pushes responses to CC's pane via
    `tmux_message`. Your turn ends after delivering the prompt.
-7. **5-minute ceiling** on the Phase 1 poll loop. A wedged Codex should
+8. **5-minute ceiling** on the Phase 1 poll loop. A wedged Codex should
    fail cleanly, not hang CC's turn.
 
 ---
