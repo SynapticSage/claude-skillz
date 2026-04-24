@@ -137,48 +137,124 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 PENDING_DIR="$SESSION_DIR/pending"
+LOCK_DIR="$SESSION_DIR/lock"
+HEALTH_FILE="$SESSION_DIR/health.json"
 
-STALE_AFTER_MIN=60
-NOW=$(date +%s)
-HOLD=0
-HELD_BY=""
-HELD_AGE_S=0
-STALE_FILES=()
+# --- Flag dispatch ---
+# $SKILL_ARGS contains the user's args after /codex-pair. Parse the
+# documented flags and act. After flag handling, $SKILL_ARGS_REST holds
+# whatever remains (the actual prompt text, possibly empty).
+FLAG_RESET_PENDING=0
+FLAG_REBOOTSTRAP=0
+FLAG_PHASE1=0
+SKILL_ARGS_REST=""
 
-if [ -d "$PENDING_DIR" ]; then
-  for f in "$PENDING_DIR"/*.json; do
-    [ -e "$f" ] || continue   # glob match nothing → no files
-    AGE_S=$(( NOW - $(stat -f %m "$f") ))   # macOS stat -f %m = mtime
-    AGE_MIN=$(( AGE_S / 60 ))
-    if [ "$AGE_MIN" -lt "$STALE_AFTER_MIN" ]; then
-      HOLD=1
-      HELD_BY="$(basename "$f" .json)"
-      HELD_AGE_S="$AGE_S"
-      break
-    else
-      STALE_FILES+=("$f")
-    fi
-  done
-fi
+# This block reads $SKILL_ARGS (set by Claude from user input). When
+# invoking the skill, the orchestration sets SKILL_ARGS to the raw
+# argument string. Substitute $SKILL_ARGS with the actual user input
+# at runtime. For documentation purposes:
+#   /codex-pair --reset-pending      → SKILL_ARGS="--reset-pending"
+#   /codex-pair --phase1 fix the bug → SKILL_ARGS="--phase1 fix the bug"
+case "${SKILL_ARGS:-}" in
+  "--reset-pending"*)  FLAG_RESET_PENDING=1 ;;
+  "--rebootstrap"*)    FLAG_REBOOTSTRAP=1; SKILL_ARGS_REST="${SKILL_ARGS#--rebootstrap}"; SKILL_ARGS_REST="${SKILL_ARGS_REST# }" ;;
+  "--phase1 "*)        FLAG_PHASE1=1;     SKILL_ARGS_REST="${SKILL_ARGS#--phase1 }" ;;
+  *)                   SKILL_ARGS_REST="${SKILL_ARGS:-}" ;;
+esac
 
-if [ $HOLD -eq 1 ]; then
-  echo "HOLD: pending request $HELD_BY still active (${HELD_AGE_S}s old)"
-  echo "  Use /codex-pair --reset-pending to clear, or wait for reply."
+# Handle --reset-pending early and exit cleanly.
+if [ $FLAG_RESET_PENDING -eq 1 ]; then
+  if [ -d "$PENDING_DIR" ]; then
+    for f in "$PENDING_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      echo "RESET: removing $(basename "$f")"
+      rm -f "$f"
+    done
+  fi
+  rm -rf "$LOCK_DIR"
+  echo "RESET: pending cleared, lock removed. Skill exiting; re-invoke /codex-pair to use."
   exit 0
 fi
 
-# Clear stale, proceed.
-for f in "${STALE_FILES[@]:-}"; do
-  [ -e "$f" ] || continue
-  echo "STALE: clearing $(basename "$f") (>${STALE_AFTER_MIN}min old)"
-  rm -f "$f"
-done
+# Handle --rebootstrap: clear bootstrap.json + health.json, fall through.
+if [ $FLAG_REBOOTSTRAP -eq 1 ]; then
+  rm -f "$SESSION_DIR/bootstrap.json" "$HEALTH_FILE"
+  echo "REBOOTSTRAP: cleared bootstrap.json + health.json"
+  # Continue to gate logic below.
+fi
+
+# --- Proactive health check ---
+# If the prior reply handler marked Phase 5 unhealthy (>=3 consecutive
+# protocol violations), surface the banner before doing anything else.
+# User can choose --phase1 or --rebootstrap from there.
+if [ -f "$HEALTH_FILE" ]; then
+  MISSES=$(python3 -c '
+import json, sys
+try: print(json.load(open(sys.argv[1])).get("phase5_consecutive_misses", 0))
+except: print(0)
+' "$HEALTH_FILE")
+  if [ "$MISSES" -ge 3 ]; then
+    echo "UNHEALTHY: Phase 5 has had ${MISSES} consecutive protocol violations."
+    echo "  Codex may not be following the contract."
+    echo "  Use /codex-pair --phase1 <prompt> to fall back, or"
+    echo "      /codex-pair --rebootstrap to retry the handshake."
+    [ $FLAG_PHASE1 -eq 0 ] && [ $FLAG_REBOOTSTRAP -eq 0 ] && exit 0
+  fi
+fi
+
+# --- Single-flight via atomic mkdir ---
+# mkdir is atomic on POSIX: exactly one caller wins. This runs BEFORE
+# pane spawn so concurrent invocations cannot both spawn duplicate
+# Codex panes. The lock dir holds metadata; we delete it on the reply
+# handler success path, on --reset-pending, or on stale TTL.
+LOCK_AGE_MAX_S=$(( 60 * 60 ))   # 60 min stale TTL
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # Lock held by another invocation. Check its age.
+  LOCK_AGE_S=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+  if [ "$LOCK_AGE_S" -lt "$LOCK_AGE_MAX_S" ]; then
+    echo "HOLD: another /codex-pair is in flight in window $WINDOW_ID (lock ${LOCK_AGE_S}s old)"
+    echo "  Use /codex-pair --reset-pending to clear, or wait."
+    exit 0
+  fi
+  # Stale: take it over.
+  echo "STALE_LOCK: claiming lock (>${LOCK_AGE_MAX_S}s old)"
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR"
+fi
+
+# Sweep stale pending files (separate from the lock; pending tracks
+# individual requests, lock guards the whole turn).
+NOW=$(date +%s)
+if [ -d "$PENDING_DIR" ]; then
+  for f in "$PENDING_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    AGE_MIN=$(( ( NOW - $(stat -f %m "$f") ) / 60 ))
+    [ "$AGE_MIN" -ge 60 ] && { echo "STALE_PENDING: clearing $(basename "$f")"; rm -f "$f"; }
+  done
+fi
+
+# Persist flag state for downstream steps to read.
+echo "$FLAG_PHASE1"     > "$SESSION_DIR/flag-phase1"
+echo "$SKILL_ARGS_REST" > "$SESSION_DIR/skill-args-rest"
 
 echo "GATE: clear"
 ```
 
-If output starts with `HOLD:`, **stop** and surface the message to the
-user verbatim. Do not proceed to Step 1.
+If output starts with `HOLD:` or `UNHEALTHY:`, **stop** and surface the
+message to the user verbatim. Do not proceed to Step 1.
+
+The lock (`$SESSION_DIR/lock/`) is **released** when:
+- the reply handler (3A.3) successfully matches a reply (`ALL_PASS`
+  outcome) — `rm -rf "$LOCK_DIR"` after deleting the pending file.
+- the user runs `/codex-pair --reset-pending`.
+- the lock is older than 60 min (next invocation force-takes it with
+  the `STALE_LOCK` warning).
+
+If 3A.1.d fails (BOOTSTRAP_TIMEOUT or ACK_INVALID), the lock IS
+released — bootstrap failure shouldn't strand the window. The
+pending file (if 3A.2.a wrote one) stays so the user can see what
+they tried.
 
 ### Skill flags handled here
 
@@ -310,11 +386,14 @@ them. Cheapest fix: always re-run the bootstrap and let it be a no-op
 when Codex is already set up. The preamble's actions are idempotent.
 Credit: Codex review 2026-04-24 Part B #2 / HIGH.
 
-#### 3A.1.a — Skip if recent ACK exists
+#### 3A.1.a — Skip only if recent AND fully validated
 
-Check `$SESSION_DIR/bootstrap.json` first. If present, fresh (≤5 min
-old), and validates against the four predicates (see 3A.1.c), skip
-the bootstrap and go straight to 3A.2 — Codex is already prepared.
+Check `$SESSION_DIR/bootstrap.json`. The skip path must run the **same
+4-predicate validation** as 3A.1.c — `mtime` alone is insufficient
+because a stale file from a prior pane can suppress rebootstrap and
+send into an unverified pane. The check below uses the actual
+`$CODEX_PANE_ID` from this turn, so a recycled bootstrap.json keyed
+to a different pane fails predicate (2) and triggers full rebootstrap.
 
 ```bash
 set -euo pipefail
@@ -323,16 +402,50 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 BFILE="$SESSION_DIR/bootstrap.json"
+# $CODEX_PANE_ID set in Step 1.
 
 SKIP_BOOTSTRAP=0
 if [ -f "$BFILE" ]; then
   AGE_S=$(( $(date +%s) - $(stat -f %m "$BFILE") ))
-  [ "$AGE_S" -lt 300 ] && SKIP_BOOTSTRAP=1
+  if [ "$AGE_S" -lt 300 ]; then
+    # Fresh enough; now run the same 4 predicates as 3A.1.c. We don't
+    # have a $BOOTSTRAP_UUID to check against on this skip-path because
+    # the existing file was bootstrapped with a prior UUID — so we
+    # accept any non-empty bootstrap_id, but require codex_pane_id +
+    # doctor_status + ts to all pass. Effectively: "this file is fresh,
+    # the right pane is bootstrapped, and the bridge works."
+    RESULT=$(python3 - "$BFILE" "$CODEX_PANE_ID" <<'PY'
+import json, sys, datetime
+path, want_pane = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f: d = json.load(f)
+except Exception as e:
+    print(f"FAIL parse: {e}"); sys.exit(0)
+if not d.get("bootstrap_id"):
+    print("FAIL no_bootstrap_id"); sys.exit(0)
+if d.get("codex_pane_id") != want_pane:
+    print(f"FAIL pane_mismatch want={want_pane} got={d.get('codex_pane_id')}")
+    sys.exit(0)
+if "Status: OK" not in d.get("doctor_status", ""):
+    print("FAIL doctor_unhealthy"); sys.exit(0)
+try:
+    ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")
+    age = (datetime.datetime.utcnow() - ts).total_seconds()
+    if age > 300 or age < -60:
+        print(f"FAIL ts_stale age={age:.0f}"); sys.exit(0)
+except Exception as e:
+    print(f"FAIL ts_unparseable: {e}"); sys.exit(0)
+print("OK")
+PY
+)
+    [ "$RESULT" = "OK" ] && SKIP_BOOTSTRAP=1 || echo "SKIP_BLOCKED: $RESULT (forcing rebootstrap)"
+  fi
 fi
 echo "SKIP_BOOTSTRAP=$SKIP_BOOTSTRAP"
 ```
 
-If `SKIP_BOOTSTRAP=1`, jump to 3A.2.
+If `SKIP_BOOTSTRAP=1`, jump to 3A.2. Otherwise (including when the
+predicates fail) fall through to 3A.1.b for a full rebootstrap.
 
 #### 3A.1.b — Compose and deliver the bootstrap preamble
 
@@ -385,21 +498,32 @@ BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
   Step 2: Run the bridge diagnostic:
         doctor = tmux_doctor()
   Step 3: Write bootstrap.json via a temp-file + atomic rename so
-          Claude does not see a partial file. Use bash through your
-          Read/Write/Bash tools:
+          Claude does not see a partial file. **The doctor output is
+          multi-line — embedding it raw in JSON produces invalid JSON
+          (literal newlines in a string).** Use python3 to JSON-encode
+          all string values before writing.
 
         TMPF="<SESSION_DIR>/bootstrap.json.tmp"
         FINAL="<SESSION_DIR>/bootstrap.json"
-        cat > "$TMPF" <<'JSON'
-        {
-          "acked": true,
-          "bootstrap_id": "<BOOTSTRAP_UUID>",
-          "codex_pane_id": "<my_pane from step 1>",
-          "doctor_status": "<full output of doctor from step 2>",
-          "ts": "<current ISO 8601 UTC, e.g. 2026-04-24T15:30:00Z>"
+
+        python3 - <<PY > "$TMPF"
+        import json, datetime
+        # Substitute the literals below with the actual values you
+        # computed in steps 1 and 2.
+        d = {
+            "acked": True,
+            "bootstrap_id": "<BOOTSTRAP_UUID>",
+            "codex_pane_id": "<my_pane from step 1>",
+            "doctor_status": """<full output of doctor from step 2>""",
+            "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        JSON
+        print(json.dumps(d, indent=2))
+        PY
         mv "$TMPF" "$FINAL"
+
+  python3's json.dumps handles all escaping automatically — newlines in
+  doctor_status become `\n` literals, quotes are escaped, etc. The
+  resulting bootstrap.json parses cleanly.
 
   Do this BEFORE acknowledging via tmux_message or waiting for input.
   The file write IS the acknowledgement. Do not use tmux_message for
@@ -668,7 +792,8 @@ import json, sys
 print(json.load(open(sys.argv[1])).get("prompt_preview", ""))
 ' "$PENDING_FILE")
   echo "PROMPT_PREVIEW=$PROMPT_PREVIEW"
-  rm -f "$PENDING_FILE"   # clear the pending entry on success
+  rm -f "$PENDING_FILE"      # clear pending entry on success
+  rm -rf "$SESSION_DIR/lock"  # release the single-flight lock
 }
 ```
 
@@ -847,7 +972,7 @@ printf '%s\n' "$RESPONSE"
 session ID in a stable location we can parse, so cold-start resume via
 `codex exec resume <id>` isn't wired up. Phase 5's push model reduces
 the need for this — session memory lives in the long-running pane, and
-the pane persists across CC restarts via `.context/codex-pane-id`.
+the pane persists across CC restarts via `$SESSION_DIR/pane-id`.
 
 Skip this step unless/until we implement it. Tracked in `TODO.md`.
 
@@ -888,8 +1013,11 @@ Codex's words inside the block.
   "Codex didn't respond within 5 minutes. Check pane `<CODEX_PANE>`
   for its current state."
 - **MCP tool call fails (Phase 5)** — the bridge server might not be
-  running or registered. Run `tmux_doctor()` to diagnose. If the bridge
-  is broken, fall back to Phase 1 for this turn.
+  running or registered. Run `tmux_doctor()` to diagnose. **Fail the
+  turn cleanly** — do NOT silently switch transports mid-flow (per
+  Invariant: transport is selected once per turn). Tell the user to
+  re-invoke with `/codex-pair --phase1 <prompt>` for an explicit
+  fallback, or fix the bridge and retry.
 - **Phase 5 reply never arrives** — Codex may have ignored the bootstrap
   contract, or its pane is waiting on approval. Open the pane
   (`tmux select-pane -t <codex_pane>`) and check visually.
@@ -931,9 +1059,12 @@ if the bridge updates upstream.
 
 ## Important invariants
 
-1. **Never modify `.context/codex-pane-id` or `codex-session-id` outside
-   this skill.** Those are the single source of truth for lifecycle
-   state.
+1. **Never modify files under `$SESSION_DIR/` outside this skill** —
+   `pane-id`, `bootstrap.json`, `pending/<req-id>.json`, `lock/`,
+   `health.json`, `flag-phase1`, `skill-args-rest`. Those files are
+   the single source of truth for lifecycle, single-flight,
+   correlation, and health state. Manual edits should only happen via
+   the `--reset-pending` / `--rebootstrap` recovery flags.
 2. **Never kill the Codex pane from the skill.** Only the user (via `q`
    or `exit` in Codex, or tmux pane-close) should close it. Respawn
    handles the case where it's already gone.
