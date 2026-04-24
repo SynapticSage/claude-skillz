@@ -114,6 +114,93 @@ does not inherit these).
 
 ---
 
+## Step 0.5 — Concurrency gate (single-flight per window)
+
+Only one outstanding `/codex-pair` request per window at a time. The
+gate runs **before** Step 1's pane spawn so concurrent invocations in
+the same window can't race during spawning. Different windows have
+separate `SESSION_DIR`s and run independently.
+
+The gate checks `$SESSION_DIR/pending/` (created in Step 0):
+- **No files** → free; proceed.
+- **One or more files exist** → check their age.
+  - Any file fresher than 60 min → **HOLD**. Refuse with a clear
+    message and point the user at the active pane. They can run
+    `/codex-pair --reset-pending` to force-clear.
+  - All files older than 60 min → **STALE**. Treat as crashed prior
+    session; delete them and proceed.
+
+```bash
+set -euo pipefail
+TMUX_BIN=/opt/homebrew/bin/tmux
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+PENDING_DIR="$SESSION_DIR/pending"
+
+STALE_AFTER_MIN=60
+NOW=$(date +%s)
+HOLD=0
+HELD_BY=""
+HELD_AGE_S=0
+STALE_FILES=()
+
+if [ -d "$PENDING_DIR" ]; then
+  for f in "$PENDING_DIR"/*.json; do
+    [ -e "$f" ] || continue   # glob match nothing → no files
+    AGE_S=$(( NOW - $(stat -f %m "$f") ))   # macOS stat -f %m = mtime
+    AGE_MIN=$(( AGE_S / 60 ))
+    if [ "$AGE_MIN" -lt "$STALE_AFTER_MIN" ]; then
+      HOLD=1
+      HELD_BY="$(basename "$f" .json)"
+      HELD_AGE_S="$AGE_S"
+      break
+    else
+      STALE_FILES+=("$f")
+    fi
+  done
+fi
+
+if [ $HOLD -eq 1 ]; then
+  echo "HOLD: pending request $HELD_BY still active (${HELD_AGE_S}s old)"
+  echo "  Use /codex-pair --reset-pending to clear, or wait for reply."
+  exit 0
+fi
+
+# Clear stale, proceed.
+for f in "${STALE_FILES[@]:-}"; do
+  [ -e "$f" ] || continue
+  echo "STALE: clearing $(basename "$f") (>${STALE_AFTER_MIN}min old)"
+  rm -f "$f"
+done
+
+echo "GATE: clear"
+```
+
+If output starts with `HOLD:`, **stop** and surface the message to the
+user verbatim. Do not proceed to Step 1.
+
+### Skill flags handled here
+
+These flags short-circuit the gate / change its behavior:
+
+- `/codex-pair --reset-pending` — clear all pending files in this
+  window's session dir, show what was cleared, **exit cleanly without
+  running Steps 1+**. The user is using this to recover from a stuck
+  state.
+- `/codex-pair --rebootstrap` — clear `$SESSION_DIR/bootstrap.json`
+  and `$SESSION_DIR/health.json`, then proceed normally. Forces a
+  fresh Phase 5 handshake. Pending state is NOT touched (use
+  `--reset-pending` separately if also needed).
+- `/codex-pair --phase1 <prompt>` — force the Phase 1 transport for
+  this turn even if MCP tools are loaded. Useful when Phase 5 has
+  marked itself unhealthy (see Health tracking section), or for
+  debugging.
+
+Strip these flags from `PROMPT_TEXT` before delivery in Step 3.
+
+---
+
 ## Step 1: Attach to or spawn the Codex pane
 
 The Codex pane is the long-running resource. We cache its pane ID in
@@ -235,7 +322,7 @@ Build a bootstrap message and send it via bracketed paste (same mechanism
 as Phase 1 — see Step 3B.1), then Enter:
 
 ```
-You are paired with Claude Code in tmux pane <CC_PANE> (label: "claude").
+You are paired with Claude Code in tmux pane <CC_PANE>.
 You have MCP tools from `tmux-bridge` for cross-pane messaging.
 
 Contract:
@@ -247,22 +334,26 @@ Contract:
      with a [tmux-bridge from:claude ...] header; you receive them as
      ordinary input.
   4. To reply to Claude, call:
-        tmux_read(target="claude")
-        tmux_message(target="claude", text=YOUR_RESPONSE)
-        tmux_read(target="claude")
-        tmux_keys(target="claude", keys=["Enter"])
+        tmux_read(target="<CC_PANE>")
+        tmux_message(target="<CC_PANE>", text=YOUR_RESPONSE)
+        tmux_read(target="<CC_PANE>")
+        tmux_keys(target="<CC_PANE>", keys=["Enter"])
 
-Upstream full contract (read if you want the long form):
+CORRELATION (important):
+  Every prompt Claude sends you will be tagged with a line like
+  [req:<8-char-uuid>] at the start of the message body. When you reply,
+  YOUR_RESPONSE must include the corresponding line:
+        [reply-to:<8-char-uuid>]
+  on its own line in your response (anywhere — header or footer is fine).
+  Match the uuid exactly to the [req:...] tag on the prompt you are
+  answering. Without this, Claude cannot match your reply to the right
+  pending request and will treat your message as unsolicited or as a
+  protocol violation.
+
+Upstream full contract:
   cat ~/.claude/skills/codex-pair/vendor/tmux-bridge-mcp/system-instruction/smux-skill.md
-  (or from tmux_list: the bridge dist lives at the path in your codex config)
 
-Before anything else, label yourself:
-  tmux_name(target=tmux_id(), label="codex")
-
-Also label Claude's pane:
-  tmux_name(target="<CC_PANE>", label="claude")
-
-Then wait for the user's actual prompt in the next message.
+Wait for the user's actual prompt in the next message.
 ```
 
 Substitute `<CC_PANE>` with the value from Step 1. Deliver this block via
@@ -277,47 +368,199 @@ to 3A.2.
 Now use the bridge tools directly. This is where Phase 5 pays off — no
 sentinels, no polling, no scrollback parsing.
 
-**All routing uses raw pane IDs (`%N`), not labels.** Pane IDs are
-globally unique within a tmux server, always present in the bridge's
-sender-identity header, and never collide. Labels are set elsewhere
-(Step 3A.1) but only for the human-visible tmux pane border — they are
-never used as the `target=` argument to bridge tools. This means the
-skill keeps working even if labels get clobbered, ignored, or
-collide. Substitute `$CODEX_PANE_ID` below with the actual pane ID
-captured in Step 1 (e.g. `%99`).
+**All routing uses raw pane IDs (`%N`), not labels.** See Invariant #5.
+Substitute `$CODEX_PANE_ID` below with the actual pane ID captured in
+Step 1 (e.g. `%99`).
+
+#### 3A.2.a — Generate req-id and persist pending state
+
+Before any MCP call, write the pending-request record. This is what
+the gate (Step 0.5) and reply handler (Step 3A.3) read.
+
+```bash
+set -euo pipefail
+TMUX_BIN=/opt/homebrew/bin/tmux
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
+
+REQ_ID=$(uuidgen | tr -d '\n-' | tr '[:upper:]' '[:lower:]' | cut -c1-8)
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# $PROMPT_TEXT is what you gathered in Step 2 (after stripping skill flags).
+# Write a sanitized first 200 chars (no newlines that would break JSON).
+PROMPT_PREVIEW=$(printf '%s' "$PROMPT_TEXT" | tr '\n\r\t' ' ' | cut -c1-200)
+
+cat > "$SESSION_DIR/pending/${REQ_ID}.json" <<EOF
+{
+  "req_id": "${REQ_ID}",
+  "started_at": "${TS}",
+  "prompt_preview": $(printf '%s' "$PROMPT_PREVIEW" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),
+  "codex_pane": "${CODEX_PANE}",
+  "window_id": "${WINDOW_ID}",
+  "cc_pane": "${TMUX_PANE}"
+}
+EOF
+
+echo "REQ_ID=$REQ_ID"
+```
+
+#### 3A.2.b — Tag the prompt and deliver via bridge
+
+Prefix `PROMPT_TEXT` with `[req:<REQ_ID>]` so the reply handler can
+match. The bootstrap preamble (Step 3A.1) instructs Codex to echo
+`[reply-to:<REQ_ID>]` in its response.
+
+Construct `TAGGED_PROMPT`:
+```
+[req:<REQ_ID>] <original PROMPT_TEXT>
+```
+
+Then call the bridge tools in order:
 
 1. **Verify the Codex pane is still present:**
-   - Call `tmux_list()` and confirm an entry whose `target` matches
-     `$CODEX_PANE_ID`. If absent, fall through to error handling — the
-     pane died between Step 1 and now (rare but possible).
-2. **Read Codex's pane to satisfy the bridge's read-before-act guard:**
-   - Call `tmux_read(target=$CODEX_PANE_ID, lines=20)`.
-3. **Send the prompt with sender-identity prefix auto-attached:**
-   - Call `tmux_message(target=$CODEX_PANE_ID, text=PROMPT_TEXT)`.
-4. **Re-read to verify the text landed in Codex's input buffer:**
-   - Call `tmux_read(target=$CODEX_PANE_ID, lines=5)`.
+   - `tmux_list()` → confirm an entry whose `target` matches
+     `$CODEX_PANE_ID`. If absent, delete the just-created pending
+     file and fall through to error handling.
+2. **Read to satisfy the bridge's read-before-act guard:**
+   - `tmux_read(target=$CODEX_PANE_ID, lines=20)`.
+3. **Send the tagged prompt:**
+   - `tmux_message(target=$CODEX_PANE_ID, text=TAGGED_PROMPT)`.
+4. **Re-read to verify text landed:**
+   - `tmux_read(target=$CODEX_PANE_ID, lines=5)`.
 5. **Submit:**
-   - Call `tmux_keys(target=$CODEX_PANE_ID, keys=["Enter"])`.
-6. **Stop.** End CC's turn with a short message to the user:
-   > "Delivered your prompt to Codex (pane `$CODEX_PANE_ID`). Codex
-   > will push its reply here when done — typically 30s–3min depending
-   > on the prompt complexity."
+   - `tmux_keys(target=$CODEX_PANE_ID, keys=["Enter"])`.
+6. **Stop.** End CC's turn with:
+   > "Delivered prompt (req-id `$REQ_ID`) to Codex pane
+   > `$CODEX_PANE_ID`. Reply will arrive in a new turn — typically
+   > 30s–3min."
 
-Do **NOT** poll `tmux_read(target=$CODEX_PANE_ID)` in a loop waiting
-for the response. That violates rule 3 of the bridge contract. Codex
-will deliver its response by calling `tmux_message(target=<CC_PANE>,
-...)`, which arrives in a new CC turn as user input.
+**Never** poll `tmux_read(target=$CODEX_PANE_ID)` waiting for a reply.
+Codex pushes via `tmux_message(target=<CC_PANE>, ...)`, which arrives
+as fresh user input in a new CC turn.
 
-### 3A.3 — Handle Codex's pushed reply (on a future CC turn)
+### 3A.3 — Handle Codex's pushed reply (three-predicate validation)
 
 When Codex finishes and pushes its response, CC will receive a new user
-message that starts with `[tmux-bridge from:codex pane:%<N> id:<uuid>]`.
-That's Codex's reply. Treat it as the response to the prior prompt:
+message that starts with a bridge header like:
+```
+[tmux-bridge from:codex pane:%83 id:b2c3d4e5]
+```
+The body should also contain a `[reply-to:<req-id>]` line that Codex
+echoes from our 3A.2 tagged prompt.
 
-- Strip the `[tmux-bridge from:codex ...]` prefix for display.
-- Present the remaining text verbatim in Step 5's format block.
-- If the user has an outstanding `/codex-pair` follow-up in the same
-  turn, loop back through 3A.2 with the new prompt.
+CC must validate **three predicates** before treating this as the
+answer to a pending request. Be strict — accepting on weaker evidence
+is how concurrent pushes get misattributed.
+
+#### 3A.3.a — Extract from the message
+
+- `from_pane` — the `pane:%N` value from the header.
+- `reply_to` — the `<uuid>` from a line matching
+  `\[reply-to:[a-f0-9]+\]` in the body. Empty if absent.
+- `body` — the message text with both the header line AND the
+  `[reply-to:...]` line removed. This is what gets shown to the user.
+
+#### 3A.3.b — Three-predicate check
+
+Read pending state and validate:
+
+```bash
+set -euo pipefail
+TMUX_BIN=/opt/homebrew/bin/tmux
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
+
+# $REPLY_TO and $FROM_PANE are extracted in 3A.3.a above
+PENDING_FILE="$SESSION_DIR/pending/${REPLY_TO}.json"
+
+OUTCOME=""
+if [ -z "$REPLY_TO" ]; then
+  OUTCOME="MISSING_TAG"      # (a)
+elif [ ! -f "$PENDING_FILE" ]; then
+  OUTCOME="LATE"              # (b) — request already cleared
+else
+  STORED_PANE=$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("codex_pane", ""))
+except Exception:
+    print("")
+' "$PENDING_FILE")
+  if [ "$STORED_PANE" = "$FROM_PANE" ]; then
+    OUTCOME="ALL_PASS"
+  elif [ -z "$STORED_PANE" ]; then
+    OUTCOME="MALFORMED"       # pending file unparseable; refuse to delete
+  else
+    OUTCOME="PANE_MISMATCH"    # (c) — actively wrong
+  fi
+fi
+
+echo "OUTCOME=$OUTCOME"
+[ "$OUTCOME" = "ALL_PASS" ] && {
+  PROMPT_PREVIEW=$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1])).get("prompt_preview", ""))
+' "$PENDING_FILE")
+  echo "PROMPT_PREVIEW=$PROMPT_PREVIEW"
+  rm -f "$PENDING_FILE"   # clear the pending entry on success
+}
+```
+
+#### 3A.3.c — Outcome handling
+
+| OUTCOME | What to do |
+|---|---|
+| `ALL_PASS` | Present `body` verbatim in Step 5 as the answer to `prompt_preview`. Pending file already deleted. **Reset health counter.** |
+| `MISSING_TAG` (a) | Show `body` with banner: "Codex sent unprompted (no `reply-to` tag). Showing verbatim; ignore if not useful." **Increment health counter.** |
+| `LATE` (b) | Show `body` with banner: "Late reply from req-id `$REPLY_TO`, which was already cleared. Showing verbatim; not treated as an answer to anything pending." **Do NOT increment health counter** — late cleanup noise isn't a Codex misbehavior signal. |
+| `PANE_MISMATCH` (c) | Show `body` with banner: "Protocol violation: reply claimed pane `$FROM_PANE` but pending request `$REPLY_TO` was for pane `$STORED_PANE`. Showing verbatim, NOT clearing pending — investigate." **Increment health counter.** Do NOT delete the pending file. |
+| `MALFORMED` | Show `body` with banner: "Pending file `$REPLY_TO.json` was unparseable. Refusing to clear; manual cleanup required (`/codex-pair --reset-pending`)." Do NOT increment health counter — this is local state corruption, not Codex misbehavior. |
+
+#### 3A.3.d — Update health counter
+
+Track in `$SESSION_DIR/health.json`:
+
+```json
+{
+  "phase5_consecutive_misses": 0,
+  "last_outcome": "ALL_PASS",
+  "last_outcome_ts": "2026-04-24T15:00:00Z"
+}
+```
+
+```bash
+# Update after determining OUTCOME
+HEALTH_FILE="$SESSION_DIR/health.json"
+# Initialize if missing
+[ -f "$HEALTH_FILE" ] || echo '{"phase5_consecutive_misses": 0}' > "$HEALTH_FILE"
+
+python3 - "$HEALTH_FILE" "$OUTCOME" <<'PY'
+import json, sys, datetime
+path, outcome = sys.argv[1], sys.argv[2]
+with open(path) as f: h = json.load(f)
+if outcome == "ALL_PASS":
+    h["phase5_consecutive_misses"] = 0
+elif outcome in ("MISSING_TAG", "PANE_MISMATCH"):
+    h["phase5_consecutive_misses"] = h.get("phase5_consecutive_misses", 0) + 1
+# LATE and MALFORMED do not increment.
+h["last_outcome"] = outcome
+h["last_outcome_ts"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(path, "w") as f: json.dump(h, f, indent=2)
+PY
+```
+
+If `phase5_consecutive_misses >= 3` after this update, **before
+reporting the response to the user**, prepend the unhealthy banner:
+> "Phase 5 has had 3+ consecutive protocol violations. Codex may not
+> be following the contract. Use `/codex-pair --phase1 <prompt>` to
+> fall back, or `/codex-pair --rebootstrap` to retry the handshake."
+
+Health counter is checked at the **start** of Step 0.5's gate logic
+on the next invocation too — if already unhealthy, surface the banner
+proactively.
 
 ---
 
