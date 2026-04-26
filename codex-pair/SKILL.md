@@ -85,7 +85,13 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # tmux window_id (e.g. @5). Without this scoping, concurrent windows
 # stomp on the same pane-id/lock/pending files. Window IDs are stable
 # within a tmux server lifetime.
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 mkdir -p "$SESSION_DIR/pending"
 
@@ -134,7 +140,13 @@ The gate checks `$SESSION_DIR/pending/` (created in Step 0):
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 PENDING_DIR="$SESSION_DIR/pending"
 LOCK_DIR="$SESSION_DIR/lock"
@@ -291,11 +303,18 @@ set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 CODEX_BIN=$(command -v codex)
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 
 PANE_FILE="$SESSION_DIR/pane-id"
-CC_PANE="$TMUX_PANE"   # the pane CC is running in — split-window targets this
+# CC_PANE is already resolved above (with $TMUX_PANE fallback) and is
+# the target for split-window; no redeclaration needed.
 
 CODEX_PANE=""
 FRESH_SPAWN=0
@@ -399,7 +418,13 @@ to a different pane fails predicate (2) and triggers full rebootstrap.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 BFILE="$SESSION_DIR/bootstrap.json"
 # $CODEX_PANE_ID set in Step 1.
@@ -568,7 +593,13 @@ validate four predicates before treating the bootstrap as confirmed.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 BFILE="$SESSION_DIR/bootstrap.json"
 
@@ -668,7 +699,13 @@ the gate (Step 0.5) and reply handler (Step 3A.3) read.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
 
@@ -686,7 +723,7 @@ cat > "$SESSION_DIR/pending/${REQ_ID}.json" <<EOF
   "prompt_preview": $(printf '%s' "$PROMPT_PREVIEW" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),
   "codex_pane": "${CODEX_PANE}",
   "window_id": "${WINDOW_ID}",
-  "cc_pane": "${TMUX_PANE}"
+  "cc_pane": "${CC_PANE}"
 }
 EOF
 
@@ -757,7 +794,13 @@ Read pending state and validate:
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 
 # $REPLY_TO and $FROM_PANE are extracted in 3A.3.a above
@@ -862,7 +905,13 @@ Use this path when MCP tools aren't available.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
 
@@ -915,7 +964,13 @@ them.
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-WINDOW_ID=$($TMUX_BIN display-message -p '#{window_id}' -t "$TMUX_PANE")
+# $TMUX_PANE isn't always inherited by CC's bash subshells (see Invariant
+# #9); fall back to the currently-active pane via tmux. The arg order
+# below also matters: `-t` must precede the format string, or tmux
+# treats `-t` and its value as positional args and errors with "too
+# many arguments" (Invariant #10).
+CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"
+WINDOW_ID=$($TMUX_BIN display-message -p -t "$CC_PANE" '#{window_id}')
 SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 CODEX_PANE=$(cat "$SESSION_DIR/pane-id")
 # $END is the sentinel from 3B.1
@@ -1100,6 +1155,22 @@ if the bridge updates upstream.
    `tmux_message`. Your turn ends after delivering the prompt.
 8. **5-minute ceiling** on the Phase 1 poll loop. A wedged Codex should
    fail cleanly, not hang CC's turn.
+9. **Resolve CC's pane via `${TMUX_PANE:-fallback}`, not bare
+   `$TMUX_PANE`.** tmux only exports `TMUX_PANE` to processes spawned
+   directly into a pane; CC's bash subshells inherit it inconsistently
+   (sometimes set, sometimes empty). Every block that needs the CC
+   pane uses
+   `CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"`
+   so it works either way. The fallback gets the currently-active
+   pane, which in normal use is the CC pane the user is reading.
+10. **`tmux display-message` requires `-t` BEFORE the format string.**
+    Order matters: `display-message -p -t %2 '#{window_id}'` works,
+    but `display-message -p '#{window_id}' -t %2` errors with
+    "command display-message: too many arguments (need at most 1)"
+    because `-t %2` after the format gets parsed as positional. Every
+    bash block in this skill uses the correct order. If you add a new
+    `display-message` call, put `-t` (and any other flag) before the
+    format.
 
 ---
 
