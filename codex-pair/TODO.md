@@ -80,6 +80,7 @@ issues. Fifteen total findings; status below.
 | I-2 | MEDIUM | `--dry-run --skip-build` emits false "MCP won't start" warning for a file that was intentionally not built | **FIXED** — warning now only fires when `DRY_RUN=0` |
 | I-3 | MEDIUM | `applyDefaults()` regex still format-fragile (single-line, semicolon-terminated). Multi-line upstream reformat would silently disable self-heal | OPEN — lower priority; upstream bridge is unlikely to reformat |
 | I-4 | LOW | Auto-clone suppressed git's stderr; bare "CLONE FAILED" gave no actionable diagnosis | **FIXED** — stderr now flows through; user sees the actual git error |
+| I-5 | HIGH | Codex registration regex `[mcp_servers\.tmux-bridge\][^\[]*` terminates inside the section at the `[` of `args = ["..."]`, so re-runs replace only the prefix and leave the array literal as orphan `["..."]` lines on subsequent rows. After several re-runs `~/.codex/config.toml` becomes invalid TOML and Codex silently fails to load the bridge. Same bug class as the earlier `applyDefaults` regex (`[^)]*`). Discovered empirically 2026-04-26 during first end-to-end install on this machine. | **FIXED** — both registration (line 422) and uninstall (line 169–171) regexes now use line-anchored boundary `^\[[A-Za-z_]` (real TOML section headers begin with letter/underscore after `[`, never with `"`), with `re.MULTILINE \| re.DOTALL`. Verified via re-run: "(already registered, unchanged)" with zero file mutation |
 
 ## Still true: Codex's assumption from the review
 

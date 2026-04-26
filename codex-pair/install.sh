@@ -165,9 +165,15 @@ PY
 import re, sys
 path = sys.argv[1]
 with open(path) as f: content = f.read()
-# Match [mcp_servers.tmux-bridge] section up to next [ or EOF
+# Match [mcp_servers.tmux-bridge] section up to next REAL section
+# header or EOF. A real header starts with `[` followed by a letter or
+# underscore (e.g. [projects."..."], [tui.foo], [plugins."..."]). The
+# `[^\[]*` form was wrong: `args = ["..."]` contains `[`, which
+# terminated the match early and left orphan array literals on
+# subsequent lines for re-runs to compound.
 pattern = re.compile(
-    r"\n*\[mcp_servers\.tmux-bridge\][^\[]*", re.MULTILINE
+    r"\n*^\[mcp_servers\.tmux-bridge\].*?(?=^\[[A-Za-z_]|\Z)",
+    re.MULTILINE | re.DOTALL,
 )
 new_content, n = pattern.subn("\n", content, count=1)
 if n:
@@ -418,8 +424,17 @@ desired = (
     f'args = ["{entry}"]\n'
 )
 
-# If section already present with correct entry, noop
-pattern = re.compile(r"\[mcp_servers\.tmux-bridge\][^\[]*", re.MULTILINE)
+# If section already present with correct entry, noop. Boundary is the
+# next REAL TOML section header — `[` followed by a letter/underscore.
+# Naive `[^\[]*` is wrong because `args = ["..."]` contains `[` and
+# would terminate the match inside the section, leaving the array tail
+# orphaned. Re-runs would then accumulate stale `["..."]` lines after
+# each `args = ` rewrite, producing invalid TOML that Codex silently
+# fails to load.
+pattern = re.compile(
+    r"^\[mcp_servers\.tmux-bridge\].*?(?=^\[[A-Za-z_]|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 m = pattern.search(content)
 if m and m.group(0).strip() == desired.strip():
     print("  (already registered, unchanged)")
