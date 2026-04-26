@@ -101,19 +101,26 @@ fi
 
 BRIDGE_ENTRY="$BRIDGE_PATH/dist/index.js"
 
-# CC settings destination
+# CC scope for `claude mcp add`. CC's MCP registry lives in
+# ~/.claude.json (NOT settings.json — settings.json is for permissions
+# and hooks; MCP servers are a separate concern). The `claude mcp`
+# subcommand is the supported way to mutate it; we use it instead of
+# editing the JSON directly because (a) the file also caches CLI state
+# we shouldn't risk corrupting, and (b) the scoping rules (local vs
+# user vs project) are enforced consistently by the CLI.
+#   --global → "user" scope (~/.claude.json `mcpServers` global key)
+#   default  → "local" scope (~/.claude.json `projects.<cwd>.mcpServers`)
+# `local` is keyed on the current working directory at registration
+# time, so it's important install.sh is run from inside the target
+# project. Credit: discovered live 2026-04-26 — earlier install.sh
+# wrote to .claude/settings.local.json's `mcpServers`, which CC
+# silently ignores.
 if [[ $GLOBAL_CC -eq 1 ]]; then
-  CC_SETTINGS="$HOME/.claude/settings.json"
+  CC_SCOPE="user"
 else
-  # Project-local. Resolve from the user's cwd (where install.sh was
-  # invoked), NOT from SCRIPT_DIR — once the skill is installed globally
-  # at ~/.claude/skills/codex-pair/, SCRIPT_DIR/../../.. resolves to
-  # $HOME, which would write to ~/.claude/settings.local.json (a real
-  # file, but not the project the caller is in). Credit: Codex review
-  # 2026-04-24 Part C #1 / HIGH.
-  PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  CC_SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
+  CC_SCOPE="local"
 fi
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 CODEX_CONFIG="$HOME/.codex/config.toml"
 
@@ -142,21 +149,13 @@ require_cmd() {
 if [[ $UNINSTALL -eq 1 ]]; then
   say "=== Uninstalling tmux-bridge from MCP configs ==="
 
-  if [[ $SKIP_CC -eq 0 && -f "$CC_SETTINGS" ]]; then
-    say "Removing from $CC_SETTINGS"
-    run python3 - "$CC_SETTINGS" <<'PY'
-import json, sys
-path = sys.argv[1]
-with open(path) as f: data = json.load(f)
-if "mcpServers" in data and "tmux-bridge" in data["mcpServers"]:
-    del data["mcpServers"]["tmux-bridge"]
-    if not data["mcpServers"]: del data["mcpServers"]
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2); f.write("\n")
-    print("  removed tmux-bridge entry")
-else:
-    print("  (not present)")
-PY
+  if [[ $SKIP_CC -eq 0 ]]; then
+    say "Removing tmux-bridge from Claude Code (scope=$CC_SCOPE)"
+    if command -v claude >/dev/null 2>&1; then
+      run claude mcp remove -s "$CC_SCOPE" tmux-bridge || say "  (not present)"
+    else
+      say "  WARNING: 'claude' CLI not found; cannot uninstall MCP entry."
+    fi
   fi
 
   if [[ $SKIP_CODEX -eq 0 && -f "$CODEX_CONFIG" ]]; then
@@ -363,35 +362,33 @@ fi
 
 if [[ $SKIP_CC -eq 0 ]]; then
   say "=== Registering MCP with Claude Code ==="
-  say "Target: $CC_SETTINGS"
+  say "Scope: $CC_SCOPE  ($([[ $CC_SCOPE == user ]] && echo 'global, ~/.claude.json mcpServers' || echo "project-local for $PROJECT_ROOT"))"
+
+  if ! command -v claude >/dev/null 2>&1; then
+    say "ERROR: 'claude' CLI not on PATH; cannot register MCP."
+    say "  Install Claude Code first: https://docs.claude.com/claude-code"
+    exit 1
+  fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    say "  [dry-run] would merge mcpServers.tmux-bridge entry"
+    say "  [dry-run] claude mcp add -s $CC_SCOPE tmux-bridge node $BRIDGE_ENTRY"
   else
-    mkdir -p "$(dirname "$CC_SETTINGS")"
-    python3 - "$CC_SETTINGS" "$BRIDGE_ENTRY" <<'PY'
-import json, os, sys
-path, entry = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f: data = json.load(f)
-except FileNotFoundError:
-    data = {}
-except json.JSONDecodeError as e:
-    sys.exit(
-        f"ERROR: {path} is not valid JSON ({e}).\n"
-        f"Refusing to overwrite — fix the file manually, then re-run install.sh."
-    )
-data.setdefault("mcpServers", {})
-existing = data["mcpServers"].get("tmux-bridge")
-new_cfg = {"command": "node", "args": [entry]}
-if existing == new_cfg:
-    print("  (already registered, unchanged)")
-else:
-    data["mcpServers"]["tmux-bridge"] = new_cfg
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2); f.write("\n")
-    print("  wrote mcpServers.tmux-bridge")
-PY
+    # Idempotency: check current registration. `claude mcp get` prints
+    # `Command:` and `Args:` on separate lines (as of Claude Code's
+    # current CLI). We extract both and compare to the desired pair to
+    # detect drift (e.g. BRIDGE_PATH changed because the user moved
+    # the skill, or the format itself changed).
+    GET_OUT=$(claude mcp get tmux-bridge 2>/dev/null || true)
+    EXIST_CMD=$(printf '%s\n' "$GET_OUT" | sed -n 's/^[[:space:]]*Command:[[:space:]]*//p')
+    EXIST_ARGS=$(printf '%s\n' "$GET_OUT" | sed -n 's/^[[:space:]]*Args:[[:space:]]*//p')
+    if [[ "$EXIST_CMD" == "node" && "$EXIST_ARGS" == "$BRIDGE_ENTRY" ]]; then
+      say "  (already registered, unchanged)"
+    else
+      # Remove first if present (silent if not), then add. This handles
+      # both first-time install and BRIDGE_PATH drift in one path.
+      claude mcp remove -s "$CC_SCOPE" tmux-bridge 2>/dev/null || true
+      claude mcp add -s "$CC_SCOPE" tmux-bridge node "$BRIDGE_ENTRY"
+    fi
   fi
   say ""
 else
@@ -459,7 +456,7 @@ fi
 
 say "=== Done ==="
 say "Bridge entry:    $BRIDGE_ENTRY"
-say "CC settings:     $CC_SETTINGS"
+say "CC MCP scope:    $CC_SCOPE  (verify with: claude mcp get tmux-bridge)"
 say "Codex config:    $CODEX_CONFIG"
 say ""
 say "Restart Claude Code and Codex for the MCP registration to take effect."
