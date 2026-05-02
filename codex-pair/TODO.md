@@ -94,3 +94,49 @@ execution and single-flight invocation, items 2 and 7 drop in severity."
 Item 7 is now fixed (cwd-invariant via `$REPO_ROOT`). Item 2
 (concurrent-invocation serialization) is still open — CC does not
 serialize skill invocations.
+
+## Bridge upstream fixes — patch-on-install path
+
+Discovered live during Phase 5 testing on 2026-04-26. Two bugs in
+`tmux-bridge-mcp` that surface when the bridge is spawned by an MCP
+client that doesn't propagate `$TMUX_PANE` (Codex CLI's MCP launcher,
+and any other launcher with a clean subprocess env):
+
+| Tag | Severity | Summary | Status |
+|---|---|---|---|
+| Bridge-A | HIGH | `tmux_id()` throws `"Not running inside a tmux pane ($TMUX_PANE is unset)"` instead of recovering | **FIXED-LOCALLY** via `patches/0001-fix-self-context.patch` (parent-process-tree env walk + `tmux list-panes` PID match). Upstream PR open: [howardpen9/tmux-bridge-mcp#2](https://github.com/howardpen9/tmux-bridge-mcp/pull/2) |
+| Bridge-B | HIGH | `tmux_message()` emits headers like `[tmux-bridge from:unknown pane:unknown id:<8hex>]` because of the same env-unset failure | **FIXED-LOCALLY** by the same patch — `message()` resolves `getSelfContext()` once at the top and uses recovered context for the `from:`/`pane:` header. Upstream PR open: [#2](https://github.com/howardpen9/tmux-bridge-mcp/pull/2) |
+| skill-16 | MEDIUM | `BRIDGE_NO_TMUX_PANE` soft-pass carve-out in Step 3A.3.b/c (added 2026-04-26 as a skill-side workaround for Bridge-B's "unknown" header) | OPEN — keep until upstream PR #2 merges and we re-vendor; then this carve-out should be deleted entirely (Codex round-2 review concurred) |
+
+### Patch-on-install distribution: cleanup triggers
+
+The current path applies `patches/0001-fix-self-context.patch` to a
+fresh `tmux-bridge-mcp` clone during `install.sh`. This is **kludgy
+on purpose** — a deliberate hotfix path until upstream lands. Trigger
+conditions to revisit:
+
+1. **Upstream PR merges** (or maintainer indicates merge timeline)
+   → delete `patches/0001-fix-self-context.patch`, drop the `patch -p1`
+   block from `install.sh`, replace with a one-line comment naming
+   the upstream version that absorbs the fix. Bump the auto-clone
+   ref to that tag/commit so re-installs pull the fixed code directly.
+2. **Patch hunk fails to apply** (upstream rebased / edited the
+   touched region underneath us) → install.sh exits loud. Regenerate
+   the patch from the fork's `fix-self-context` branch against new
+   upstream HEAD with `git format-patch -1 HEAD --stdout -- src/
+   package.json` and commit the refreshed artifact.
+3. **Second unrelated patch accumulates** → don't keep stacking
+   format-patches. Pivot to a fork-pinned `BRIDGE_REPO` (install.sh
+   clones `SynapticSage/tmux-bridge-mcp` instead of upstream) or a
+   git submodule. Carrying two patches is the inflection point where
+   the kludge stops being cheaper than a clean fork.
+4. **Upstream goes silent >4 weeks after PR opens** → same pivot as
+   (3). At that point we're effectively running our own bridge; we
+   should own the distribution path explicitly, not pretend we're
+   just patching upstream's.
+
+User note (2026-05-02): "very kludgy to apply this patch, but I'm
+okay with doing that for now. We should take a note that later we
+should clean this up and perhaps be more professional about our
+release path for this feature." Logging that here so the next pass
+through this skill remembers the trigger conditions.

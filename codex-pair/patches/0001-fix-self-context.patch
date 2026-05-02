@@ -1,0 +1,639 @@
+From 1024360fdd49da4c03d1a0d458f424b345bc0cd0 Mon Sep 17 00:00:00 2001
+From: Ryan Young <git@ryanyoung.io>
+Date: Fri, 1 May 2026 01:11:36 -0400
+Subject: [PATCH] Recover self-context (paneId + TMUX env) when launched
+ without TMUX_PANE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the bridge is spawned as a subprocess by an MCP client that
+doesn't propagate $TMUX_PANE (notably Codex CLI's MCP launcher, but
+applies to any spawner that doesn't explicitly forward tmux env vars),
+two cascading bugs surface:
+
+  Bridge-A: tmux_id() throws "Not running inside a tmux pane
+            ($TMUX_PANE is unset)" instead of recovering.
+  Bridge-B: tmux_message() emits headers like
+            "[tmux-bridge from:unknown pane:unknown id:<8hex>]"
+            because it falls back to the literal string "unknown" when
+            process.env.TMUX_PANE is empty.
+
+Both were observable live in codex-pair on 2026-04-26. Codex worked
+around them by walking tmux_list() output to identify itself, but
+every MCP consumer of the bridge has to re-derive that workaround.
+
+Fix
+---
+Add a getSelfContext() helper that recovers both the pane ID *and*
+the TMUX env (so detectSocketArgs() targets the right server, not
+just the right pane). Three-tier resolution:
+
+  1. Fast path: process.env.TMUX_PANE / process.env.TMUX (current
+     behavior).
+  2. Walk parent process tree unbounded (until pid 1 / 0 / cycle),
+     collecting ancestor PIDs. For each ancestor read its env via
+     /proc/<pid>/environ (Linux) or `ps eww -p <pid>` (macOS / BSD).
+     Return the first ancestor with TMUX_PANE set.
+  3. Final fallback: query `tmux list-panes -a -F '#{pane_pid}
+     #{pane_id}'` and match collected ancestor PIDs against pane PIDs.
+     Socket args remain unrecovered in this branch (we couldn't recover
+     TMUX env, so we use the default socket — log a warning).
+
+The result is cached at module scope so repeated tmux invocations
+don't re-walk the process tree.
+
+Threading
+---------
+Three callsites consumed bare process.env.TMUX_PANE:
+
+  - id() (returned the env value or threw).
+  - message() (used "unknown" as a fallback for the from:/pane: header).
+  - assertNotSelf() (loop-prevention check; silently disabled when env
+    was unset).
+
+assertNotSelf() stays sync; signature changed from
+  (paneId, action) => (targetPaneId, selfPaneId, action)
+so callers (type/message/keys) resolve self-context once at the top
+and pass selfPaneId in. message() additionally uses the recovered
+context for its from:/pane: header, eliminating the "unknown" literal.
+
+tmux() now warms the self-context cache before each call so
+detectSocketArgs() automatically picks up any recovered TMUX env.
+A private rawTmux() helper exists to break the bootstrap recursion
+in computeSelfContext()'s fallback (it can't depend on socket
+detection — that's the thing it's trying to recover).
+
+Tests
+-----
+- Unit tests for assertNotSelf cover the four scenarios threading
+  exposes (target==self for message/type, target!=self, self===undefined).
+- Unit tests for getSelfContext cover the env-set fast path and the
+  cache memoization invariant.
+- New integration test (env-scrub.test.ts) spawns a node subprocess
+  inside the test runner's tmux pane with TMUX/TMUX_PANE cleared
+  and asserts:
+    (a) getSelfContext() returns a concrete %N (not throwing),
+    (b) the recovered context includes the parent's TMUX env,
+    (c) the recovered paneId is never the literal "unknown".
+  Skipped when the test process is not itself running inside a tmux
+  pane (test infra dependency, not a logic dependency).
+
+Other
+-----
+- Bumped MCP server version literal in src/index.ts (was 0.1.0,
+  out-of-sync with package.json which is now 0.3.1) so clients see
+  consistent version signals.
+- doctor() now reports recovered self-context when env was unset,
+  so users can see whether and via which path recovery succeeded.
+
+Verified
+--------
+- 61 tests pass (was 52 pre-change; +7 unit + 2 integration).
+- Live verified on 2026-04-30 via codex-pair Phase 5 round-trip:
+  bridge subprocess spawned by Codex with empty TMUX_PANE successfully
+  recovers and emits headers with concrete pane:%N values.
+---
+ package.json                                |   2 +-
+ src/__tests__/integration.env-scrub.test.ts |  92 ++++++++
+ src/__tests__/self-context.test.ts          |  90 ++++++++
+ src/index.ts                                |   2 +-
+ src/tmux-bridge.ts                          | 242 +++++++++++++++++++-
+ 5 files changed, 414 insertions(+), 14 deletions(-)
+ create mode 100644 src/__tests__/integration.env-scrub.test.ts
+ create mode 100644 src/__tests__/self-context.test.ts
+
+diff --git a/package.json b/package.json
+index b7bcbac..12b9e99 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "tmux-bridge-mcp",
+-  "version": "0.3.0",
++  "version": "0.3.1",
+   "description": "Standalone MCP server + CLI adapters for cross-pane AI agent communication via tmux",
+   "type": "module",
+   "main": "dist/index.js",
+diff --git a/src/__tests__/integration.env-scrub.test.ts b/src/__tests__/integration.env-scrub.test.ts
+new file mode 100644
+index 0000000..8109438
+--- /dev/null
++++ b/src/__tests__/integration.env-scrub.test.ts
+@@ -0,0 +1,92 @@
++import { describe, it, expect } from "vitest";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import { fileURLToPath } from "node:url";
++import { dirname, resolve } from "node:path";
++
++const execFileAsync = promisify(execFile);
++
++// This is the regression test for the live bug encountered in
++// codex-pair on 2026-04-26: when the bridge is spawned by an MCP
++// client that doesn't propagate $TMUX_PANE, getSelfContext() must
++// still recover the pane via the parent-process-tree walk.
++//
++// Skip when not running inside a tmux pane (the test machine isn't
++// guaranteed to have tmux). The CI/local matrix that DOES have tmux
++// gets the meaningful coverage.
++
++const inTmux = process.env.TMUX_PANE !== undefined;
++const describeIfTmux = inTmux ? describe : describe.skip;
++
++const DIST = resolve(
++  dirname(fileURLToPath(import.meta.url)),
++  "..",
++  "..",
++  "dist",
++);
++
++describeIfTmux("env-scrub integration", () => {
++  it("getSelfContext recovers paneId when TMUX_PANE is unset in child env", async () => {
++    // Spawn a node child with TMUX_PANE/TMUX cleared. The child's
++    // PARENT (the test runner) does have those env vars set (we're
++    // skipping otherwise), so the parent-walk should find them.
++    const script = `
++      import("${DIST}/tmux-bridge.js").then(async (m) => {
++        try {
++          const ctx = await m.getSelfContext();
++          process.stdout.write(JSON.stringify({ ok: true, paneId: ctx.paneId, hasTmux: !!ctx.tmuxEnv }));
++        } catch (e) {
++          process.stdout.write(JSON.stringify({ ok: false, error: e.message }));
++        }
++      });
++    `;
++
++    const cleanEnv = { ...process.env };
++    delete cleanEnv.TMUX_PANE;
++    delete cleanEnv.TMUX;
++
++    const { stdout } = await execFileAsync(
++      "node",
++      ["--input-type=module", "-e", script],
++      { env: cleanEnv, timeout: 15_000 },
++    );
++
++    const result = JSON.parse(stdout);
++    expect(result.ok).toBe(true);
++    // Codex's HIGH-1: not just paneId — recovered TMUX env too, so
++    // tmux invocations target the right server.
++    expect(result.paneId).toMatch(/^%\d+$/);
++    expect(result.hasTmux).toBe(true);
++  });
++
++  it("tmux_message header reads concrete pane:%N (not 'unknown')", async () => {
++    // Spawn a child with cleared env, have it call message() to a
++    // benign target (its own discovered pane is fine — message()
++    // refuses self, so we use the parent pane). Capture the header
++    // it would emit by reading the implementation's intended output:
++    // we verify the recovery, not the actual sending.
++    //
++    // Simplest assertion: getSelfContext().paneId is not the literal
++    // string "unknown" — that's the bug Codex flagged in
++    // tmux-bridge-mcp's message() pre-fix (Bridge-B).
++    const script = `
++      import("${DIST}/tmux-bridge.js").then(async (m) => {
++        const ctx = await m.getSelfContext();
++        process.stdout.write(ctx.paneId);
++      });
++    `;
++
++    const cleanEnv = { ...process.env };
++    delete cleanEnv.TMUX_PANE;
++    delete cleanEnv.TMUX;
++
++    const { stdout } = await execFileAsync(
++      "node",
++      ["--input-type=module", "-e", script],
++      { env: cleanEnv, timeout: 15_000 },
++    );
++
++    expect(stdout.trim()).not.toBe("unknown");
++    expect(stdout.trim()).toMatch(/^%\d+$/);
++  });
++});
+diff --git a/src/__tests__/self-context.test.ts b/src/__tests__/self-context.test.ts
+new file mode 100644
+index 0000000..da4c0fb
+--- /dev/null
++++ b/src/__tests__/self-context.test.ts
+@@ -0,0 +1,90 @@
++import { describe, it, expect, beforeEach, afterAll } from "vitest";
++import {
++  assertNotSelf,
++  getSelfContext,
++  __resetSelfContextForTesting,
++} from "../tmux-bridge.js";
++
++// Loop-prevention: this is the bug Codex flagged in the threading
++// review. Pre-fix, assertNotSelf read process.env.TMUX_PANE directly,
++// so loop prevention silently disabled when env was scrubbed. Post-fix,
++// the function takes selfPaneId as a parameter; the env-scrub case
++// becomes the responsibility of getSelfContext (recovery). These tests
++// pin the new contract.
++describe("assertNotSelf (post-threading)", () => {
++  it("throws when target equals self with action=message", () => {
++    expect(() => assertNotSelf("%5", "%5", "message")).toThrow(
++      /loop prevention/i,
++    );
++  });
++
++  it("throws when target equals self with action=type", () => {
++    expect(() => assertNotSelf("%5", "%5", "type")).toThrow(
++      /Cannot interact with your own pane/i,
++    );
++  });
++
++  it("does not throw when target differs from self", () => {
++    expect(() => assertNotSelf("%5", "%7", "type")).not.toThrow();
++    expect(() => assertNotSelf("%5", "%7", "message")).not.toThrow();
++    expect(() => assertNotSelf("%5", "%7", "keys")).not.toThrow();
++  });
++
++  it("does not throw when self is undefined (recovery returned nothing)", () => {
++    // This preserves the prior fall-through behavior for the case where
++    // we genuinely cannot determine our own pane. The recovery helper
++    // (getSelfContext) is responsible for throwing in that case before
++    // assertNotSelf is reached — but the function itself stays defensive.
++    expect(() => assertNotSelf("%5", undefined, "type")).not.toThrow();
++  });
++});
++
++describe("getSelfContext (env fast path)", () => {
++  // Snapshot/restore env to keep tests hermetic.
++  const originalTmuxPane = process.env.TMUX_PANE;
++  const originalTmux = process.env.TMUX;
++
++  beforeEach(() => {
++    __resetSelfContextForTesting();
++  });
++
++  afterAll(() => {
++    if (originalTmuxPane !== undefined) {
++      process.env.TMUX_PANE = originalTmuxPane;
++    } else {
++      delete process.env.TMUX_PANE;
++    }
++    if (originalTmux !== undefined) {
++      process.env.TMUX = originalTmux;
++    } else {
++      delete process.env.TMUX;
++    }
++    __resetSelfContextForTesting();
++  });
++
++  it("returns env paneId immediately when TMUX_PANE is set", async () => {
++    process.env.TMUX_PANE = "%42";
++    process.env.TMUX = "/tmp/tmux-501/default,12345,0";
++    const ctx = await getSelfContext();
++    expect(ctx.paneId).toBe("%42");
++    expect(ctx.tmuxEnv).toBe("/tmp/tmux-501/default,12345,0");
++  });
++
++  it("returns env paneId without TMUX env when TMUX_PANE alone is set", async () => {
++    process.env.TMUX_PANE = "%99";
++    delete process.env.TMUX;
++    const ctx = await getSelfContext();
++    expect(ctx.paneId).toBe("%99");
++    expect(ctx.tmuxEnv).toBeUndefined();
++  });
++
++  it("caches the resolved value (second call doesn't re-walk)", async () => {
++    process.env.TMUX_PANE = "%cached";
++    const first = await getSelfContext();
++    // Even if we mutate env after the first resolution, the cache wins.
++    process.env.TMUX_PANE = "%mutated";
++    const second = await getSelfContext();
++    expect(second.paneId).toBe(first.paneId);
++    expect(second.paneId).toBe("%cached");
++  });
++});
+diff --git a/src/index.ts b/src/index.ts
+index 34c0796..24ae50a 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -6,7 +6,7 @@ import * as bridge from "./tmux-bridge.js";
+ 
+ const server = new McpServer({
+   name: "tmux-bridge",
+-  version: "0.1.0",
++  version: "0.3.1",
+ });
+ 
+ export function err(e: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
+diff --git a/src/tmux-bridge.ts b/src/tmux-bridge.ts
+index f3540a4..d942d9c 100644
+--- a/src/tmux-bridge.ts
++++ b/src/tmux-bridge.ts
+@@ -48,6 +48,172 @@ export function clearRead(paneId: string): void {
+   }
+ }
+ 
++// --- Self-context recovery ---
++// When the bridge is spawned by an MCP client that doesn't propagate
++// TMUX_PANE/TMUX (e.g. Codex CLI's MCP launcher), we still need to
++// determine our own pane ID and the tmux server we belong to. Walk
++// the parent process tree to find an ancestor that has the env vars
++// set, then fall back to matching against `tmux list-panes`.
++
++export type SelfContext = { paneId: string; tmuxEnv?: string };
++
++let selfContextPromise: Promise<SelfContext | null> | null = null;
++// Sync mirror so detectSocketArgs() (a sync function) can consult the
++// recovered TMUX env without blocking. Populated by the same promise.
++let selfContextResolved: SelfContext | null | undefined = undefined;
++
++function ensureSelfContextWarmed(): Promise<SelfContext | null> {
++  if (selfContextPromise === null) {
++    selfContextPromise = computeSelfContext().then((ctx) => {
++      selfContextResolved = ctx;
++      return ctx;
++    });
++  }
++  return selfContextPromise;
++}
++
++/** Test-only: reset the self-context cache so tests can re-exercise
++ *  the recovery logic with different process.env arrangements. Not
++ *  intended for production code paths.
++ */
++export function __resetSelfContextForTesting(): void {
++  selfContextPromise = null;
++  selfContextResolved = undefined;
++}
++
++async function computeSelfContext(): Promise<SelfContext | null> {
++  // Fast path: env is set in our own process.
++  if (process.env.TMUX_PANE) {
++    return { paneId: process.env.TMUX_PANE, tmuxEnv: process.env.TMUX };
++  }
++
++  // Walk the parent process tree, collecting ancestor PIDs.
++  // Unbounded — fixed-depth caps fail on double-fork / daemon launchers.
++  // Cycle protection via `seen`. Stop at pid 1 (init) or pid 0.
++  const ancestors: number[] = [];
++  const seen = new Set<number>();
++  let pid = process.pid;
++  while (pid > 1 && !seen.has(pid)) {
++    seen.add(pid);
++    ancestors.push(pid);
++    try {
++      const { stdout } = await execFileAsync(
++        "ps",
++        ["-o", "ppid=", "-p", String(pid)],
++        { timeout: 5_000 },
++      );
++      const ppid = parseInt(stdout.trim(), 10);
++      if (!Number.isFinite(ppid) || ppid <= 0 || ppid === pid) break;
++      pid = ppid;
++    } catch {
++      break;
++    }
++  }
++
++  // Read each ancestor's environment via `ps eww -p <pid>` (macOS) /
++  // `/proc/<pid>/environ` (Linux). First ancestor with TMUX_PANE wins.
++  for (const apid of ancestors) {
++    const env = await readProcessEnv(apid);
++    if (!env) continue;
++    const tmuxPane = env.get("TMUX_PANE");
++    if (tmuxPane) {
++      return { paneId: tmuxPane, tmuxEnv: env.get("TMUX") };
++    }
++  }
++
++  // Final fallback: query tmux directly and match ancestor PIDs against
++  // pane PIDs. Use rawTmux (no socket detection) since we have no
++  // recovered TMUX env at this point — this fallback only finds us if
++  // we're on the default socket. Document this limitation by warning
++  // when it succeeds without a recovered tmuxEnv.
++  try {
++    const out = await rawTmux(
++      "list-panes",
++      "-a",
++      "-F",
++      "#{pane_pid} #{pane_id}",
++    );
++    const panePidMap = new Map<number, string>();
++    for (const line of out.split("\n")) {
++      const [pidStr, paneId] = line.trim().split(/\s+/);
++      const ppid = parseInt(pidStr ?? "", 10);
++      if (Number.isFinite(ppid) && paneId?.startsWith("%")) {
++        panePidMap.set(ppid, paneId);
++      }
++    }
++    for (const apid of ancestors) {
++      const match = panePidMap.get(apid);
++      if (match) {
++        // We recovered the pane ID, but not the TMUX env. If the user
++        // is on a non-default socket, subsequent tmux calls will hit
++        // the wrong server. Log loud once so this is diagnosable.
++        // eslint-disable-next-line no-console
++        console.error(
++          `tmux-bridge: recovered self-pane ${match} via list-panes match (TMUX env not recovered; assuming default socket)`,
++        );
++        return { paneId: match };
++      }
++    }
++  } catch {
++    // Default socket has no panes, or tmux not available. Fall through
++    // to null — public getSelfContext() will throw a clear error.
++  }
++
++  return null;
++}
++
++async function readProcessEnv(pid: number): Promise<Map<string, string> | null> {
++  if (process.platform === "linux") {
++    try {
++      const { readFile } = await import("node:fs/promises");
++      const buf = await readFile(`/proc/${pid}/environ`);
++      const env = new Map<string, string>();
++      for (const entry of buf.toString("utf8").split("\0")) {
++        const eq = entry.indexOf("=");
++        if (eq > 0) env.set(entry.slice(0, eq), entry.slice(eq + 1));
++      }
++      return env;
++    } catch {
++      return null;
++    }
++  }
++  // macOS / BSD: ps eww emits env vars space-separated after COMMAND.
++  // TMUX_PANE (=%N) and TMUX (=/path,pid,N) values contain no spaces,
++  // so a regex scan over the whole line is safe even though general
++  // env values could contain spaces.
++  try {
++    const { stdout } = await execFileAsync(
++      "ps",
++      ["eww", "-o", "command=", "-p", String(pid)],
++      { timeout: 5_000 },
++    );
++    const env = new Map<string, string>();
++    // Match KEY=VALUE pairs where VALUE has no whitespace.
++    const re = /(?:^|\s)([A-Z_][A-Z0-9_]*)=(\S*)/g;
++    for (const m of stdout.matchAll(re)) {
++      env.set(m[1], m[2]);
++    }
++    return env;
++  } catch {
++    return null;
++  }
++}
++
++/** Public: resolve the bridge's own pane context. Throws if all
++ *  recovery paths fail (genuinely outside tmux). Cached after first
++ *  resolution so repeated calls are free.
++ */
++export async function getSelfContext(): Promise<SelfContext> {
++  const ctx = await ensureSelfContextWarmed();
++  if (!ctx) {
++    throw new Error(
++      "Not running inside a tmux pane ($TMUX_PANE is unset and " +
++        "parent-process-tree walk found no tmux ancestor)",
++    );
++  }
++  return ctx;
++}
++
+ // --- tmux socket detection ---
+ 
+ function detectSocketArgs(): string[] {
+@@ -59,7 +225,13 @@ function detectSocketArgs(): string[] {
+     return ["-S", override];
+   }
+ 
+-  const tmuxEnv = process.env.TMUX;
++  // Direct env first; fall back to recovered context cache populated
++  // by ensureSelfContextWarmed().
++  let tmuxEnv = process.env.TMUX;
++  if (!tmuxEnv && selfContextResolved && selfContextResolved.tmuxEnv) {
++    tmuxEnv = selfContextResolved.tmuxEnv;
++  }
++
+   if (tmuxEnv) {
+     const socket = tmuxEnv.split(",")[0];
+     if (socket && existsSync(socket)) {
+@@ -71,7 +243,23 @@ function detectSocketArgs(): string[] {
+   return [];
+ }
+ 
++/** Bypasses socket detection — used only inside computeSelfContext()
++ *  to avoid recursion (the final list-panes fallback can't depend on
++ *  socket recovery, since that's exactly what we're trying to recover).
++ */
++async function rawTmux(...args: string[]): Promise<string> {
++  const { stdout } = await execFileAsync("tmux", args, {
++    timeout: 10_000,
++    env: { ...process.env },
++  });
++  return stdout;
++}
++
+ async function tmux(...args: string[]): Promise<string> {
++  // Warm the self-context cache so detectSocketArgs() can consult any
++  // recovered TMUX env. First call walks parent processes; subsequent
++  // calls are free.
++  await ensureSelfContextWarmed();
+   const socketArgs = detectSocketArgs();
+   const { stdout } = await execFileAsync("tmux", [...socketArgs, ...args], {
+     timeout: 10_000,
+@@ -137,9 +325,12 @@ async function getPaneId(target: string): Promise<string> {
+ 
+ // --- Loop Prevention ---
+ 
+-function assertNotSelf(paneId: string, action: string): void {
+-  const self = process.env.TMUX_PANE;
+-  if (self && paneId === self) {
++export function assertNotSelf(
++  targetPaneId: string,
++  selfPaneId: string | undefined,
++  action: string,
++): void {
++  if (selfPaneId && targetPaneId === selfPaneId) {
+     if (action === "message") {
+       throw new Error("Cannot send message to your own pane (loop prevention)");
+     }
+@@ -208,7 +399,11 @@ export async function type(target: string, text: string): Promise<void> {
+   const resolved = await resolveTarget(target);
+   await validateTarget(resolved);
+   const paneId = await getPaneId(resolved);
+-  assertNotSelf(paneId, "type");
++  // Resolve self via the recovery helper, not bare process.env.TMUX_PANE.
++  // Throws if we're genuinely outside tmux — the right behavior, since
++  // we couldn't act anyway.
++  const { paneId: selfPaneId } = await getSelfContext();
++  assertNotSelf(paneId, selfPaneId, "type");
+   requireRead(paneId);
+ 
+   await tmux("send-keys", "-t", resolved, "-l", "--", text);
+@@ -222,11 +417,16 @@ export async function message(
+   const resolved = await resolveTarget(target);
+   await validateTarget(resolved);
+   const paneId = await getPaneId(resolved);
+-  assertNotSelf(paneId, "message");
++  // Resolve self-context once: used for loop-prevention, the `from:`
++  // label, and the `pane:` field of the bridge header. Recovers the
++  // sender's pane ID even when $TMUX_PANE wasn't propagated to this
++  // process — fixes "from:unknown pane:unknown" headers.
++  const { paneId: senderPane } = await getSelfContext();
++  assertNotSelf(paneId, senderPane, "message");
+   requireRead(paneId);
+ 
+-  // Detect sender identity
+-  const senderPane = process.env.TMUX_PANE || "unknown";
++  // Sender label: looked up by pane ID. tmuxNoFail handles the case
++  // where the pane has no @name set (returns "" → fall back to pane ID).
+   const senderLabel = await tmuxNoFail(
+     "display-message",
+     "-t",
+@@ -249,7 +449,8 @@ export async function keys(
+   const resolved = await resolveTarget(target);
+   await validateTarget(resolved);
+   const paneId = await getPaneId(resolved);
+-  assertNotSelf(paneId, "keys");
++  const { paneId: selfPaneId } = await getSelfContext();
++  assertNotSelf(paneId, selfPaneId, "keys");
+   requireRead(paneId);
+ 
+   for (const key of keyList) {
+@@ -279,9 +480,11 @@ export async function resolve(label: string): Promise<string> {
+ }
+ 
+ export async function id(): Promise<string> {
+-  const pane = process.env.TMUX_PANE;
+-  if (!pane) throw new Error("Not running inside a tmux pane ($TMUX_PANE is unset)");
+-  return pane;
++  // Use the recovery helper instead of bare process.env so the bridge
++  // works when launched as an MCP subprocess that didn't inherit
++  // $TMUX_PANE (e.g. Codex CLI's launcher). See getSelfContext().
++  const { paneId } = await getSelfContext();
++  return paneId;
+ }
+ 
+ // --- Sensible Defaults ---
+@@ -322,6 +525,21 @@ export async function doctor(): Promise<string> {
+     `TMUX_BRIDGE_SOCKET: ${process.env.TMUX_BRIDGE_SOCKET || "<unset>"}`
+   );
+ 
++  // Surface recovered self-context (when env was unset, this is what
++  // we walked the parent process tree to find). Helps diagnose whether
++  // recovery worked and which path it took.
++  if (!process.env.TMUX_PANE || !process.env.TMUX) {
++    try {
++      const ctx = await getSelfContext();
++      lines.push(
++        `recovered pane:     ${ctx.paneId}${ctx.tmuxEnv ? "" : " (TMUX env unrecovered — assuming default socket)"}`,
++      );
++      if (ctx.tmuxEnv) lines.push(`recovered TMUX:     ${ctx.tmuxEnv}`);
++    } catch (e) {
++      lines.push(`recovered pane:     <none — ${e instanceof Error ? e.message : String(e)}>`);
++    }
++  }
++
+   // Check tmux binary
+   try {
+     const ver = await tmux("-V");
+-- 
+2.52.0
+

@@ -1,3 +1,5 @@
 adversarial/DESIGN.md
 adversarial/gpt54crit.md
 codex-pair/vendor/
+# Local fork checkout for the bridge — see codex-pair/TODO.md "patch-on-install"
+tmux-bridge-mcp/

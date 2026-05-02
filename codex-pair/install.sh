@@ -315,6 +315,51 @@ else:
     print(f"  (no drift; hardening intact: {', '.join(present) if present else 'NONE'})")
 PY
   fi
+
+  # --- format-patch: getSelfContext recovery (Bridge-A + Bridge-B) ---
+  # This is a real git commit on a fork branch (fix-self-context),
+  # exported as a unified diff and applied here. Lives until the
+  # upstream PR merges; cleanup trigger documented in TODO.md.
+  # See plan: ~/.claude/plans/refactored-discovering-unicorn.md
+  PATCH_FILE="$SCRIPT_DIR/patches/0001-fix-self-context.patch"
+  if [[ -f "$PATCH_FILE" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      say "  [dry-run] would dry-run + apply $PATCH_FILE to $BRIDGE_PATH"
+    else
+      # Three outcomes from `patch -p1 --dry-run`:
+      #   exit 0:        all hunks apply cleanly; do it for real.
+      #   "Reversed (or previously applied) patch detected":
+      #                  patch already in (re-run, or upstream merged).
+      #                  Skip — don't fail, don't double-apply.
+      #   any other failure: hunks don't match → upstream moved underneath us.
+      #                  Fail loud so we can revisit the patch, never partially apply.
+      DRY_LOG=$(mktemp)
+      if (cd "$BRIDGE_PATH" && patch -p1 --dry-run --check < "$PATCH_FILE") >"$DRY_LOG" 2>&1; then
+        DRY_RC=0
+      else
+        DRY_RC=$?
+      fi
+      DRY_OUT=$(cat "$DRY_LOG")
+      rm -f "$DRY_LOG"
+      if printf '%s' "$DRY_OUT" | grep -q 'Reversed.*previously applied'; then
+        say "  format-patch already applied (skipping)"
+      elif [[ $DRY_RC -eq 0 ]]; then
+        if (cd "$BRIDGE_PATH" && patch -p1 < "$PATCH_FILE" >/dev/null 2>&1); then
+          say "  applied: 0001-fix-self-context.patch (Bridge-A + Bridge-B)"
+        else
+          say "  ERROR: format-patch dry-run passed but apply failed."
+          say "  Inspect: cd $BRIDGE_PATH && patch -p1 < $PATCH_FILE"
+          exit 1
+        fi
+      else
+        say "  ERROR: format-patch does not apply cleanly to current bridge tree."
+        say "  Upstream likely moved. Revisit $PATCH_FILE."
+        say "  patch dry-run output (rc=$DRY_RC):"
+        printf '%s\n' "$DRY_OUT" | sed 's/^/    /'
+        exit 1
+      fi
+    fi
+  fi
   say ""
 else
   say "=== Skipping local patches (--skip-patches) ==="; say ""
