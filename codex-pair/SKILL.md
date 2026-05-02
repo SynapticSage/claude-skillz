@@ -159,6 +159,7 @@ HEALTH_FILE="$SESSION_DIR/health.json"
 FLAG_RESET_PENDING=0
 FLAG_REBOOTSTRAP=0
 FLAG_PHASE1=0
+MODEL_OVERRIDE=""
 SKILL_ARGS_REST=""
 
 # This block reads $SKILL_ARGS (set by Claude from user input). When
@@ -167,10 +168,15 @@ SKILL_ARGS_REST=""
 # at runtime. For documentation purposes:
 #   /codex-pair --reset-pending      → SKILL_ARGS="--reset-pending"
 #   /codex-pair --phase1 fix the bug → SKILL_ARGS="--phase1 fix the bug"
+#   /codex-pair --model gpt-5.5 hi   → SKILL_ARGS="--model gpt-5.5 hi"
 case "${SKILL_ARGS:-}" in
   "--reset-pending"*)  FLAG_RESET_PENDING=1 ;;
   "--rebootstrap"*)    FLAG_REBOOTSTRAP=1; SKILL_ARGS_REST="${SKILL_ARGS#--rebootstrap}"; SKILL_ARGS_REST="${SKILL_ARGS_REST# }" ;;
   "--phase1 "*)        FLAG_PHASE1=1;     SKILL_ARGS_REST="${SKILL_ARGS#--phase1 }" ;;
+  "--model "*)         REST="${SKILL_ARGS#--model }"
+                       MODEL_OVERRIDE="${REST%% *}"
+                       SKILL_ARGS_REST="${REST#"$MODEL_OVERRIDE"}"
+                       SKILL_ARGS_REST="${SKILL_ARGS_REST# }" ;;
   *)                   SKILL_ARGS_REST="${SKILL_ARGS:-}" ;;
 esac
 
@@ -249,6 +255,17 @@ fi
 # Persist flag state for downstream steps to read.
 echo "$FLAG_PHASE1"     > "$SESSION_DIR/flag-phase1"
 echo "$SKILL_ARGS_REST" > "$SESSION_DIR/skill-args-rest"
+# flag-model: only present when this turn requested an override. Cleared
+# otherwise so a stale override from a previous turn never reanimates.
+if [ -n "$MODEL_OVERRIDE" ]; then
+  printf '%s\n' "$MODEL_OVERRIDE" > "$SESSION_DIR/flag-model"
+else
+  rm -f "$SESSION_DIR/flag-model"
+fi
+# model-warning is per-turn (Step 1 writes it on reuse path; Step 5 reads
+# and surfaces it). Always clear at the gate so a stale warning can't
+# leak into a turn that didn't request --model.
+rm -f "$SESSION_DIR/model-warning"
 
 echo "GATE: clear"
 ```
@@ -284,6 +301,18 @@ These flags short-circuit the gate / change its behavior:
   this turn even if MCP tools are loaded. Useful when Phase 5 has
   marked itself unhealthy (see Health tracking section), or for
   debugging.
+- `/codex-pair --model <name> <prompt>` — request a specific Codex
+  model for *this spawn only*. The flag is consumed at
+  `tmux split-window` time (Step 1) and threaded into `codex` as
+  `--model <name>`. **Spawn-time only**: codex's model is fixed once
+  the TUI is up, so passing `--model` against an existing pane is a
+  no-op for the running codex. The skill detects this case (reuse
+  path) and emits a `WARN` line that Step 5 surfaces in the status
+  block. To actually switch models, kill the codex pane
+  (`codex /exit` inside the pane, or `tmux kill-pane -t <CODEX_PANE>`)
+  and re-invoke with the new `--model`. With no flag, codex picks up
+  whatever `~/.codex/config.toml` declares (default behavior
+  unchanged).
 
 Strip these flags from `PROMPT_TEXT` before delivery in Step 3.
 
@@ -324,6 +353,15 @@ if [ -f "$PANE_FILE" ]; then
   if $TMUX_BIN list-panes -a -F '#{pane_id}' | grep -qFx "$SAVED"; then
     CODEX_PANE="$SAVED"
     echo "REUSING: $CODEX_PANE"
+    # If --model was passed but we're reusing a pane, the flag is dead
+    # weight: codex's model is fixed at spawn. Don't silent-drop —
+    # write a warning that Step 5 surfaces in the status line.
+    if [ -s "$SESSION_DIR/flag-model" ]; then
+      REQUESTED=$(cat "$SESSION_DIR/flag-model")
+      WARN="WARN: --model $REQUESTED ignored — pane $CODEX_PANE is being reused (codex's model is fixed at spawn). To switch, kill the codex pane (codex /exit, or tmux kill-pane -t $CODEX_PANE) and re-invoke with --model."
+      echo "$WARN" >&2
+      printf '%s\n' "$WARN" > "$SESSION_DIR/model-warning"
+    fi
   else
     echo "STALE: $SAVED (pane gone — respawning)"
     rm -f "$PANE_FILE"
@@ -335,9 +373,16 @@ if [ -z "$CODEX_PANE" ]; then
   # pane ID. -F formats it. Launches $CODEX_BIN (absolute) in the new pane
   # so PATH differences between CC's shell env and tmux server env cannot
   # leave us with the wrong codex.
-  CODEX_PANE=$($TMUX_BIN split-window -h -d -P -F '#{pane_id}' -t "$CC_PANE" "$CODEX_BIN")
+  # SPAWN_ARGS optionally carries --model <value> from Step 0.5. Empty
+  # array expansion under set -u is unsafe on bash 3.2 (macOS default),
+  # so use the ${arr[@]+"${arr[@]}"} idiom — expands to nothing when
+  # unset, splats correctly when set.
+  SPAWN_ARGS=()
+  [ -s "$SESSION_DIR/flag-model" ] && SPAWN_ARGS+=("--model" "$(cat "$SESSION_DIR/flag-model")")
+  CODEX_PANE=$($TMUX_BIN split-window -h -d -P -F '#{pane_id}' -t "$CC_PANE" "$CODEX_BIN" ${SPAWN_ARGS[@]+"${SPAWN_ARGS[@]}"})
   echo "$CODEX_PANE" > "$PANE_FILE"
   echo "SPAWNED: $CODEX_PANE"
+  [ ${#SPAWN_ARGS[@]} -gt 0 ] && echo "  with: ${SPAWN_ARGS[*]}"
   FRESH_SPAWN=1
   # Codex takes a few seconds to boot its TUI. Give it time before sending.
   sleep 4
@@ -1045,7 +1090,16 @@ CODEX SAYS:
 ════════════════════════════════════════════════════════════
 Pane: <CODEX_PANE> (<REUSING|SPAWNED>)
 Transport: <Phase 5 MCP push | Phase 1 sentinel pull>
+<MODEL_WARNING_LINE if $SESSION_DIR/model-warning exists>
 ```
+
+If `$SESSION_DIR/model-warning` exists, read it and append the contents
+as a separate line **inside** the status block (between the bottom rule
+and the closing fence, after `Transport:`). Don't reformat — emit the
+file's content verbatim. This is how the `--model` reuse-path warning
+reaches the user; do not bury it in stderr only. The warning file is
+cleared at the gate of the next invocation, so it only surfaces on the
+turn that earned it.
 
 After the block, you may add your own synthesis as a separate paragraph
 — e.g. "I agree with Codex on X but disagree on Y because Z." Never edit
