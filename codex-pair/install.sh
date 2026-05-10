@@ -301,6 +301,93 @@ if m:
                + content[m.end():])
     applied.append("applyDefaults() neutered")
 
+# --- Pass 2: B-trim (token-optimization Tier 1) ---
+# Compresses tool descriptions and drops redundant param `.describe()`
+# strings. Pass 1 (above) already added Zod constraints; Pass 2 strips
+# the verbose .describe() text and shortens tool descriptions while
+# keeping operational hints (Read first / no Enter / cannot target self).
+# Source of truth: codex-pair/TOKEN_OPTIMIZATION_RESEARCH.md (Codex GO).
+# Each replace pair: (post-pass-1 form) -> (B-trimmed final form).
+btrim = [
+    # tmux_read — tool desc + param describes (lines schema is Pass-1 hardened)
+    (
+        '"Read the last N lines from a tmux pane. Must be called before type/keys (read guard). Target can be a pane ID (%N), session:window.pane, or a label."',
+        '"Read recent lines from a tmux pane. Required before type/keys/message (read guard)."',
+    ),
+    (
+        '.describe("Number of lines to read (default 50, max 1000)")',
+        '',
+    ),
+    # tmux_type — tool desc + drop param describes (text already has .max from Pass 1)
+    (
+        '"Type text into a tmux pane WITHOUT pressing Enter. You must tmux_read the pane first (read guard enforced). After typing, use tmux_read to verify, then tmux_keys to press Enter."',
+        '"Type text into a pane WITHOUT pressing Enter. Read first (guard); verify with another read, then tmux_keys for Enter."',
+    ),
+    (
+        '''    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    text: z.string().max(10000).describe("Text to type into the pane (max 10000 chars)"),''',
+        '''    target: z.string(),
+    text: z.string().max(10000),''',
+    ),
+    # tmux_message — tool desc + drop param describes (text already has .max)
+    (
+        '"Send a message to another agent\'s pane with auto-prepended sender info, reply target, and correlation ID. Cannot message your own pane (loop prevention). Must tmux_read first."',
+        '"Send a message to another pane (auto-adds sender + reply tag). Cannot target self (loop prevention). Read first."',
+    ),
+    (
+        '''    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    text: z.string().max(10000).describe("Message to send (max 10000 chars)"),''',
+        '''    target: z.string(),
+    text: z.string().max(10000),''',
+    ),
+    # tmux_keys — tool desc + drop param describes
+    (
+        '"Send special keys to a tmux pane (Enter, Escape, C-c, etc.). Must tmux_read first."',
+        '"Send special keys to a pane (Enter, Escape, C-c). Read first."',
+    ),
+    (
+        '''    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    keys: z
+      .array(z.string())
+      .describe('Keys to send, e.g. ["Enter"], ["Escape"], ["C-c"]'),''',
+        '''    target: z.string(),
+    keys: z.array(z.string()),''',
+    ),
+    # tmux_name — tool desc + drop param describes
+    (
+        '"Label a tmux pane for easy addressing (e.g., \'gemini\', \'claude\'). The label appears in the tmux border."',
+        '"Label a pane (e.g. \'gemini\', \'claude\'). Appears in pane border."',
+    ),
+    (
+        '''    target: z.string().describe("Pane target: ID (%0) or session:win.pane"),
+    label: z.string().describe("Label to assign"),''',
+        '''    target: z.string(),
+    label: z.string(),''',
+    ),
+    # tmux_resolve — drop param describe (tool desc is already short)
+    (
+        '    label: z.string().describe("Label to resolve"),',
+        '    label: z.string(),',
+    ),
+    # tmux_id — tool desc only
+    (
+        '"Print the current pane\'s tmux ID ($TMUX_PANE). Useful for self-identification when labeling."',
+        '"Return current pane\'s tmux ID."',
+    ),
+    # tmux_doctor — tool desc only
+    (
+        '"Diagnose tmux connectivity issues — checks socket, env vars, and pane visibility"',
+        '"Diagnose tmux connectivity (socket, env, panes)."',
+    ),
+]
+
+for old, new in btrim:
+    if old in content:
+        content = content.replace(old, new, 1)
+        # Tag the applied change by what it shortened. Use a stable label.
+        label = old[:40].replace('"', '').strip().split('.')[0][:30]
+        applied.append(f"btrim: {label}...")
+
 if content != orig:
     with open(path, "w") as f: f.write(content)
     for name in applied:
@@ -308,9 +395,17 @@ if content != orig:
 else:
     # Report what's already present so re-runs are informative
     present = []
-    if '.max(10000).describe("Text to type' in content: present.append("tmux_type")
-    if '.max(10000).describe("Message to send' in content: present.append("tmux_message")
-    if '.max(1000)' in content and 'Number of lines to read' in content: present.append("tmux_read")
+    if '.max(10000).describe("Text to type' in content: present.append("tmux_type-hardened")
+    if '.max(10000).describe("Message to send' in content: present.append("tmux_message-hardened")
+    if '.max(1000)' in content and 'Number of lines to read' in content: present.append("tmux_read-hardened")
+    if 'text: z.string().max(10000),\n' in content: present.append("tmux_type-btrimmed")
+    if 'Read recent lines from a tmux pane' in content: present.append("tmux_read-btrimmed")
+    if 'Type text into a pane WITHOUT pressing Enter' in content: present.append("tmux_type-btrimmed")
+    if 'Send a message to another pane (auto-adds' in content: present.append("tmux_message-btrimmed")
+    if 'Send special keys to a pane (Enter, Escape' in content: present.append("tmux_keys-btrimmed")
+    if "Label a pane (e.g. 'gemini'" in content: present.append("tmux_name-btrimmed")
+    if "Return current pane's tmux ID" in content: present.append("tmux_id-btrimmed")
+    if 'Diagnose tmux connectivity (socket' in content: present.append("tmux_doctor-btrimmed")
     if '// bridge.applyDefaults()' in content: present.append("applyDefaults-neutered")
     print(f"  (no drift; hardening intact: {', '.join(present) if present else 'NONE'})")
 PY

@@ -1,4 +1,4 @@
-From 550fd1fdab819dc6b10c420798e2bb22ec61e250 Mon Sep 17 00:00:00 2001
+From ecd022dca938aa5cec4b7ca05dea62f862bd2248 Mon Sep 17 00:00:00 2001
 From: Ryan Young <git@ryanyoung.io>
 Date: Fri, 1 May 2026 01:11:36 -0400
 Subject: [PATCH] Recover self-context (paneId + TMUX env) when launched
@@ -97,9 +97,9 @@ Verified
  package.json                                |   2 +-
  src/__tests__/integration.env-scrub.test.ts |  92 ++++++++
  src/__tests__/self-context.test.ts          |  90 ++++++++
- src/index.ts                                |  44 ++--
+ src/index.ts                                |   2 +-
  src/tmux-bridge.ts                          | 242 +++++++++++++++++++-
- 5 files changed, 432 insertions(+), 38 deletions(-)
+ 5 files changed, 414 insertions(+), 14 deletions(-)
  create mode 100644 src/__tests__/integration.env-scrub.test.ts
  create mode 100644 src/__tests__/self-context.test.ts
 
@@ -310,7 +310,7 @@ index 0000000..da4c0fb
 +  });
 +});
 diff --git a/src/index.ts b/src/index.ts
-index 34c0796..42fc3a0 100644
+index 34c0796..24ae50a 100644
 --- a/src/index.ts
 +++ b/src/index.ts
 @@ -6,7 +6,7 @@ import * as bridge from "./tmux-bridge.js";
@@ -322,111 +322,6 @@ index 34c0796..42fc3a0 100644
  });
  
  export function err(e: unknown): { content: Array<{ type: "text"; text: string }>; isError: true } {
-@@ -38,14 +38,10 @@ server.tool(
- 
- server.tool(
-   "tmux_read",
--  "Read the last N lines from a tmux pane. Must be called before type/keys (read guard). Target can be a pane ID (%N), session:window.pane, or a label.",
-+  "Read recent lines from a tmux pane. Required before type/keys/message (read guard).",
-   {
-     target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
--    lines: z
--      .number()
--      .optional()
--      .default(50)
--      .describe("Number of lines to read (default 50)"),
-+    lines: z.number().optional().default(50),
-   },
-   async ({ target, lines }) => {
-     try {
-@@ -59,10 +55,10 @@ server.tool(
- 
- server.tool(
-   "tmux_type",
--  "Type text into a tmux pane WITHOUT pressing Enter. You must tmux_read the pane first (read guard enforced). After typing, use tmux_read to verify, then tmux_keys to press Enter.",
-+  "Type text into a pane WITHOUT pressing Enter. Read first (guard); verify with another read, then tmux_keys for Enter.",
-   {
--    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
--    text: z.string().describe("Text to type into the pane"),
-+    target: z.string(),
-+    text: z.string(),
-   },
-   async ({ target, text }) => {
-     try {
-@@ -76,10 +72,10 @@ server.tool(
- 
- server.tool(
-   "tmux_message",
--  "Send a message to another agent's pane with auto-prepended sender info, reply target, and correlation ID. Cannot message your own pane (loop prevention). Must tmux_read first.",
-+  "Send a message to another pane (auto-adds sender + reply tag). Cannot target self (loop prevention). Read first.",
-   {
--    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
--    text: z.string().describe("Message to send"),
-+    target: z.string(),
-+    text: z.string(),
-   },
-   async ({ target, text }) => {
-     try {
-@@ -95,12 +91,10 @@ server.tool(
- 
- server.tool(
-   "tmux_keys",
--  "Send special keys to a tmux pane (Enter, Escape, C-c, etc.). Must tmux_read first.",
-+  "Send special keys to a pane (Enter, Escape, C-c). Read first.",
-   {
--    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
--    keys: z
--      .array(z.string())
--      .describe('Keys to send, e.g. ["Enter"], ["Escape"], ["C-c"]'),
-+    target: z.string(),
-+    keys: z.array(z.string()),
-   },
-   async ({ target, keys }) => {
-     try {
-@@ -118,10 +112,10 @@ server.tool(
- 
- server.tool(
-   "tmux_name",
--  "Label a tmux pane for easy addressing (e.g., 'gemini', 'claude'). The label appears in the tmux border.",
-+  "Label a pane (e.g. 'gemini', 'claude'). Appears in pane border.",
-   {
--    target: z.string().describe("Pane target: ID (%0) or session:win.pane"),
--    label: z.string().describe("Label to assign"),
-+    target: z.string(),
-+    label: z.string(),
-   },
-   async ({ target, label }) => {
-     try {
-@@ -137,9 +131,9 @@ server.tool(
- 
- server.tool(
-   "tmux_resolve",
--  "Look up a pane's target ID by its label",
-+  "Look up a pane's target ID by its label.",
-   {
--    label: z.string().describe("Label to resolve"),
-+    label: z.string(),
-   },
-   async ({ label }) => {
-     try {
-@@ -153,7 +147,7 @@ server.tool(
- 
- server.tool(
-   "tmux_id",
--  "Print the current pane's tmux ID ($TMUX_PANE). Useful for self-identification when labeling.",
-+  "Return current pane's tmux ID.",
-   {},
-   async () => {
-     try {
-@@ -167,7 +161,7 @@ server.tool(
- 
- server.tool(
-   "tmux_doctor",
--  "Diagnose tmux connectivity issues — checks socket, env vars, and pane visibility",
-+  "Diagnose tmux connectivity (socket, env, panes).",
-   {},
-   async () => {
-     try {
 diff --git a/src/tmux-bridge.ts b/src/tmux-bridge.ts
 index f3540a4..d942d9c 100644
 --- a/src/tmux-bridge.ts

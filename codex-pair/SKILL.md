@@ -786,23 +786,47 @@ Construct `TAGGED_PROMPT`:
 [req:<REQ_ID>] <original PROMPT_TEXT>
 ```
 
+**Pending-file cleanup invariant (read first).** *Any* bridge
+delivery call below that fails before the final `tmux_keys` submit
+must:
+1. Delete the just-created `$SESSION_DIR/pending/${REQ_ID}.json`.
+2. Release the lock with `rm -rf "$SESSION_DIR/lock"`.
+3. Fall through to the error path — surface the error to the user.
+
+This applies to step 1 (`tmux_read`) AND step 2 (`tmux_message`)
+equally. After dropping the `tmux_list` pre-check (M1), the first
+`tmux_read` is the new target-validation point — if the Codex pane
+is gone, `bridge.read()` raises before `tmux_message` runs, so don't
+gate cleanup on a `tmux_message` failure alone (Codex review
+2026-05-10 / HIGH).
+
 Then call the bridge tools in order:
 
 1. **Read to satisfy the bridge's read-before-act guard:**
    - `tmux_read(target=$CODEX_PANE_ID, lines=5)`. (M2 — was
      `lines=20`; the response isn't semantically used, the call only
      marks the read-guard so 5 lines is enough.)
+   - If this fails (pane gone, bridge unhealthy), apply the cleanup
+     invariant above and surface "Codex pane `$CODEX_PANE_ID` is no
+     longer reachable; respawn with a fresh `/codex-pair`."
 2. **Send the tagged prompt:**
    - `tmux_message(target=$CODEX_PANE_ID, text=TAGGED_PROMPT)`.
-   - If the pane is gone, `bridge.message`'s internal
-     `validateTarget` raises a clear error. Catch it, delete the
-     just-created pending file, and fall through to error handling.
-     (M1 — replaces the prior `tmux_list()` pre-check, which cost
-     ~800 tok at 33 panes for redundant validation.)
+   - If the pane vanished between step 1 and step 2,
+     `bridge.message`'s internal `validateTarget` raises a clear
+     error. Apply the cleanup invariant. (M1 — replaces the prior
+     `tmux_list()` pre-check, which cost ~800–1300 tok per turn at
+     33–53 panes for redundant validation.)
 3. **Re-read to verify text landed:**
    - `tmux_read(target=$CODEX_PANE_ID, lines=5)`.
+   - If this fails, apply the cleanup invariant. The prompt may have
+     been delivered (step 2 succeeded), so also surface "Prompt may
+     have been delivered to a now-gone pane; check
+     `$SESSION_DIR/pending/` for orphan state."
 4. **Submit:**
    - `tmux_keys(target=$CODEX_PANE_ID, keys=["Enter"])`.
+   - If this fails, the prompt is queued in Codex's TUI but
+     unsubmitted. Apply the cleanup invariant and surface the
+     ambiguity.
 5. **Stop.** End CC's turn with:
    > "Delivered prompt (req-id `$REQ_ID`) to Codex pane
    > `$CODEX_PANE_ID`. Reply will arrive in a new turn — typically
