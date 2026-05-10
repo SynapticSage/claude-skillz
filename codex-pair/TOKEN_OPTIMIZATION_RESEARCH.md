@@ -15,7 +15,9 @@ may have moved since this snapshot.
 ## Executive summary
 
 Three cost surfaces (all numbers below assume the live measurement
-context: 33 active tmux panes, ~500-char user prompt):
+context: 33 active tmux panes, ~500-char user prompt — dated
+snapshot from 2026-05-02; live `tmux_doctor` at 2026-05-10 reported
+**53 panes**, so M1 scales upward in the user's actual environment).
 
 1. **Per-turn MCP calls** (Phase 5 hot path): ~1640 tok / turn at 33
    panes. Dominated by `tmux_list` (~800 tok response — scales with

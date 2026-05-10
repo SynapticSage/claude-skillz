@@ -459,6 +459,16 @@ send into an unverified pane. The check below uses the actual
 `$CODEX_PANE_ID` from this turn, so a recycled bootstrap.json keyed
 to a different pane fails predicate (2) and triggers full rebootstrap.
 
+**TTL** is defined once as `$TTL_S` and applied to *both* freshness
+gates (the outer `mtime` check and the inner predicate-4 `ts` check)
+so they can't drift. Cold turns saved by extending the TTL are paid
+back by a cheap `tmux_id()` health probe in 3A.1.a.x — that catches
+the stale-tool-surface case (Codex restart with the bridge unloaded,
+config drift, tmux server restart with pane-id reuse). Credit:
+Codex round-1 review HIGH on H2 / 2026-05-02. (H2 — was 5 min, now
+30 min. Per-turn cost of probe ~10 tok; amortized across ~15× more
+hot turns vs. before.)
+
 ```bash
 set -euo pipefail
 TMUX_BIN=/opt/homebrew/bin/tmux
@@ -474,19 +484,26 @@ SESSION_DIR="$REPO_ROOT/.context/codex-pair/$WINDOW_ID"
 BFILE="$SESSION_DIR/bootstrap.json"
 # $CODEX_PANE_ID set in Step 1.
 
+# H2: bootstrap-skip TTL. Define once; both gates (outer bash mtime
+# and inner python ts) read this. 30 min lets idle-resume cases
+# (user steps away, comes back) skip the full bootstrap; the
+# tmux_id() health probe in 3A.1.a.x catches stale-tool-surface
+# regressions.
+TTL_S=1800
+
 SKIP_BOOTSTRAP=0
 if [ -f "$BFILE" ]; then
   AGE_S=$(( $(date +%s) - $(stat -f %m "$BFILE") ))
-  if [ "$AGE_S" -lt 300 ]; then
+  if [ "$AGE_S" -lt "$TTL_S" ]; then
     # Fresh enough; now run the same 4 predicates as 3A.1.c. We don't
     # have a $BOOTSTRAP_UUID to check against on this skip-path because
     # the existing file was bootstrapped with a prior UUID — so we
     # accept any non-empty bootstrap_id, but require codex_pane_id +
     # doctor_status + ts to all pass. Effectively: "this file is fresh,
     # the right pane is bootstrapped, and the bridge works."
-    RESULT=$(python3 - "$BFILE" "$CODEX_PANE_ID" <<'PY'
+    RESULT=$(python3 - "$BFILE" "$CODEX_PANE_ID" "$TTL_S" <<'PY'
 import json, sys, datetime
-path, want_pane = sys.argv[1], sys.argv[2]
+path, want_pane, ttl_s = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
     with open(path) as f: d = json.load(f)
 except Exception as e:
@@ -501,8 +518,9 @@ if "Status: OK" not in d.get("doctor_status", ""):
 try:
     ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")
     age = (datetime.datetime.utcnow() - ts).total_seconds()
-    if age > 300 or age < -60:
-        print(f"FAIL ts_stale age={age:.0f}"); sys.exit(0)
+    # H2: both gates use the same TTL_S. -60s tolerates clock skew.
+    if age > ttl_s or age < -60:
+        print(f"FAIL ts_stale age={age:.0f} ttl={ttl_s}"); sys.exit(0)
 except Exception as e:
     print(f"FAIL ts_unparseable: {e}"); sys.exit(0)
 print("OK")
@@ -514,10 +532,55 @@ fi
 echo "SKIP_BOOTSTRAP=$SKIP_BOOTSTRAP"
 ```
 
-If `SKIP_BOOTSTRAP=1`, jump to 3A.2. Otherwise (including when the
-predicates fail) fall through to 3A.1.b for a full rebootstrap.
+If `SKIP_BOOTSTRAP=1`, run 3A.1.a.x (the probe) before jumping to
+3A.2. Otherwise (file-check predicates failed, or freshness expired)
+fall through to 3A.1.b for a full rebootstrap.
+
+#### 3A.1.a.x — Cheap health probe on the skip path
+
+The 4-predicate check in 3A.1.a verifies the *cached* bootstrap state.
+Predicate 3 (`Status: OK` in `doctor_status`) checks the doctor output
+captured during the *previous* bootstrap, not the current state. With
+the TTL extended to 30 min, that cache can mask Codex-side MCP tool
+loss, config drift, or pane-id reuse after a tmux server restart.
+
+Mitigation: when `SKIP_BOOTSTRAP=1`, call `tmux_id()` via the bridge
+**once** as a current-state probe. Two outcomes:
+
+- `tmux_id()` returns a value matching `$CODEX_PANE_ID` → bridge is
+  healthy on Codex's side, proceed to 3A.2 with `SKIP_BOOTSTRAP=1`.
+- `tmux_id()` errors, returns mismatched value, or times out → force
+  `SKIP_BOOTSTRAP=0`. Surface to the user:
+  > "Phase 5 health probe failed (Codex's bridge tools may have
+  > unloaded). Forcing rebootstrap. If this recurs, try
+  > `/codex-pair --rebootstrap` explicitly or check the pane state."
+  Then fall through to 3A.1.b.
+
+Cost: one MCP call (~10 tok). Catches the stale-tool-surface failure
+mode that the longer TTL otherwise enables.
+
+If you reach this step from a SKIP path and the probe fails, the
+`tmux_id` call's own tool args + response are the cleanup cost — no
+pending file is in flight yet (3A.2.a hasn't run), so no extra
+state to delete.
 
 #### 3A.1.b — Compose and deliver the bootstrap preamble
+
+H1 from token-optimization: the **static** bridge contract (Read-Act-
+Read cycle, never poll, pane-ID routing, tool quick-reference) is
+loaded into Codex's context once at TUI startup via the managed section
+of `~/.codex/AGENTS.md` (written by `install.sh`'s `--skip-agents`
+gated step). The per-turn preamble below carries only the **dynamic**
+bits that change per-turn: this turn's `BOOTSTRAP_UUID`, the CC pane
+ID, the session-dir path, the file-ACK protocol, correlation tags,
+and labeling commands. Net per-cold-turn savings: ~370 tok.
+
+If `~/.codex/AGENTS.md` is missing the managed section (e.g. user
+hasn't run `install.sh`), Codex won't know the static contract and
+this preamble alone is insufficient. Symptom: bootstrap ACKed but
+later replies don't include `[reply-to:...]` tags or come from the
+wrong pane. Recovery: re-run `~/.claude/skills/codex-pair/install.sh`
+and exit/respawn the codex pane (TUI reload).
 
 Generate a `BOOTSTRAP_UUID` (8-hex), then compose the preamble Codex
 must read. The preamble instructs Codex to:
@@ -532,32 +595,18 @@ with concrete values from this turn:
 
 ```
 You are paired with Claude Code in tmux pane <CC_PANE>.
-You have MCP tools from `tmux-bridge` for cross-pane messaging.
+The static bridge contract (Read-Act-Read, never poll, pane-ID
+routing, tool quick-ref) is in your AGENTS.md context. This message
+carries the dynamic per-turn bits.
 
-Contract:
-  1. Read before write. Always call tmux_read(target) before tmux_type,
-     tmux_message, or tmux_keys on that target.
-  2. Read-Act-Read cycle. After typing, read again to verify text landed,
-     then send Enter via tmux_keys.
-  3. Never poll for replies. Claude will push new prompts into YOUR pane
-     with a [tmux-bridge from:claude ...] header; you receive them as
-     ordinary input.
-  4. To reply to Claude, call:
-        tmux_read(target="<CC_PANE>")
-        tmux_message(target="<CC_PANE>", text=YOUR_RESPONSE)
-        tmux_read(target="<CC_PANE>")
-        tmux_keys(target="<CC_PANE>", keys=["Enter"])
+PER-TURN ROUTING:
+  - CC's pane: <CC_PANE>
+  - Reply by: tmux_read(<CC_PANE>) → tmux_message(<CC_PANE>, text=YOUR_RESPONSE) → tmux_read(<CC_PANE>) → tmux_keys(<CC_PANE>, keys=["Enter"]).
 
-CORRELATION (important):
-  Every prompt Claude sends you will be tagged with a line like
-  [req:<8-char-uuid>] at the start of the message body. When you reply,
-  YOUR_RESPONSE must include the corresponding line:
-        [reply-to:<8-char-uuid>]
-  on its own line in your response (anywhere — header or footer is fine).
-  Match the uuid exactly to the [req:...] tag on the prompt you are
-  answering. Without this, Claude cannot match your reply to the right
-  pending request and will treat your message as unsolicited or as a
-  protocol violation.
+CORRELATION:
+  Every prompt is tagged [req:<8-char-uuid>]. Your reply must include
+  [reply-to:<8-char-uuid>] on its own line, matching the uuid exactly.
+  Without this, Claude treats your message as unsolicited.
 
 BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
   Confirm setup by running a bridge self-test and writing a file Claude
@@ -599,27 +648,11 @@ BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
   The file write IS the acknowledgement. Do not use tmux_message for
   the ACK — Claude waits on the file, not a message.
 
-LABELING (cosmetic only, do this AFTER the bootstrap ACK is written):
-  After writing bootstrap.json, label both panes for human visibility
-  in the tmux pane border. These labels are NOT used for routing —
-  Claude addresses you by raw pane ID (%N) — but they make the border
-  more readable when you have multiple agent panes open:
+LABELING (cosmetic, AFTER bootstrap ACK):
+  tmux_read(target=tmux_id()); tmux_name(target=tmux_id(), label="codex-<WINDOW_ID>")
+  tmux_read(target="<CC_PANE>"); tmux_name(target="<CC_PANE>", label="claude-<WINDOW_ID>")
 
-        tmux_read(target=tmux_id())   # satisfy read-guard
-        tmux_name(target=tmux_id(), label="codex-<WINDOW_ID>")
-        tmux_read(target="<CC_PANE>")
-        tmux_name(target="<CC_PANE>", label="claude-<WINDOW_ID>")
-
-  Window-scoped labels avoid collisions when more than one /codex-pair
-  session runs on the same tmux server. If labeling fails (read-guard
-  rejects, etc.), it does not block anything — Claude doesn't depend on
-  labels.
-
-Upstream full contract:
-  cat ~/.claude/skills/codex-pair/vendor/tmux-bridge-mcp/system-instruction/smux-skill.md
-
-Wait for the user's actual prompt in the next message (it will arrive
-via tmux_message and contain a [req:<uuid>] tag).
+Wait for the user's actual prompt in the next message (it will contain a [req:<uuid>] tag).
 ```
 
 Substitute `<CC_PANE>`, `<BOOTSTRAP_UUID>`, `<SESSION_DIR>` with their

@@ -13,6 +13,7 @@
 #   --skip-build            skip npm install + build (use if already built)
 #   --skip-register-cc      don't touch Claude Code settings
 #   --skip-register-codex   don't touch Codex config
+#   --skip-agents           don't inject the bridge contract into ~/.codex/AGENTS.md
 #   --skip-patches          don't verify/re-apply local hardening to bridge src
 #   --no-auto-clone         exit with instructions if bridge clone missing,
 #                           instead of auto-cloning from GitHub
@@ -41,6 +42,7 @@ set -euo pipefail
 SKIP_BUILD=0
 SKIP_CC=0
 SKIP_CODEX=0
+SKIP_AGENTS=0
 SKIP_PATCHES=0
 GLOBAL_CC=0
 UNINSTALL=0
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build)          SKIP_BUILD=1; shift ;;
     --skip-register-cc)    SKIP_CC=1; shift ;;
     --skip-register-codex) SKIP_CODEX=1; shift ;;
+    --skip-agents)         SKIP_AGENTS=1; shift ;;
     --skip-patches)        SKIP_PATCHES=1; shift ;;
     --no-auto-clone)       AUTO_CLONE=0; shift ;;
     --global)              GLOBAL_CC=1; shift ;;
@@ -183,6 +186,34 @@ else:
 PY
   fi
 
+  if [[ $SKIP_AGENTS -eq 0 ]]; then
+    AGENTS_FILE="$HOME/.codex/AGENTS.md"
+    if [[ -f "$AGENTS_FILE" ]]; then
+      say "Removing managed section from $AGENTS_FILE"
+      run python3 - "$AGENTS_FILE" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path) as f: content = f.read()
+begin = "<!-- codex-pair:begin"
+end = "<!-- codex-pair:end -->"
+# Match from begin marker (anchored with the prefix above; user may have
+# changed the trailing parenthetical in the marker line, so don't pin
+# the whole opener) through the end marker. DOTALL so `.` matches newlines.
+pat = re.compile(
+    re.escape(begin) + r".*?" + re.escape(end) + r"\n?",
+    re.DOTALL,
+)
+new, n = pat.subn("", content, count=1)
+if n:
+    new = new.rstrip() + "\n" if new.strip() else ""
+    with open(path, "w") as f: f.write(new)
+    print(f"  removed managed section from {path}")
+else:
+    print("  (no managed section present)")
+PY
+    fi
+  fi
+
   say "Done. Bridge clone at $BRIDGE_PATH was NOT deleted."
   exit 0
 fi
@@ -248,7 +279,7 @@ if [[ $SKIP_PATCHES -eq 0 && -d "$BRIDGE_PATH" ]]; then
   say "=== Applying local hardening patches ==="
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    say "  [dry-run] would verify + re-apply Zod .max() patches and neuter applyDefaults()"
+    say "  [dry-run] would verify + re-apply Zod .max() hardening, B-trim tool descriptions (Tier 1 token-opt), and neuter applyDefaults()"
   else
     python3 - "$BRIDGE_PATH/src/index.ts" <<'PY'
 import re, sys
@@ -590,6 +621,102 @@ PY
   say ""
 else
   say "=== Skipping Codex registration (--skip-register-codex) ==="; say ""
+fi
+
+# --- Inject bridge contract into ~/.codex/AGENTS.md (H1) -----------------
+# H1 from TOKEN_OPTIMIZATION_RESEARCH.md (Codex round-3 GO). Codex CLI
+# loads ~/.codex/AGENTS.md as model-visible system-instruction context
+# at TUI startup. Putting the static bridge contract there shrinks the
+# per-turn bootstrap preamble (sent on every cold-path /codex-pair turn)
+# from ~3,967 chars / ~990 tok down to just the dynamic handshake.
+#
+# Tradeoff (Codex round-3 wording): the injected section adds ~580
+# model-visible tokens to **every Codex turn** that loads the managed
+# AGENTS.md section, not just /codex-pair turns. Net positive only if
+# /codex-pair cold turns happen >1.6x per Codex non-pair session.
+#
+# Idempotency: markered injection. <!-- codex-pair:begin --> ... end -->.
+# - File missing: create it with just our section.
+# - Markers absent: append our section, preserve any pre-existing content.
+# - Markers present: replace section content between them, leave user's
+#   surrounding edits intact.
+#
+# Source of truth: $BRIDGE_PATH/system-instruction/smux-skill.md (52
+# lines, ~580 tok). Generic bridge contract; pair-specific bits stay
+# in the per-turn preamble.
+
+if [[ $SKIP_AGENTS -eq 0 ]]; then
+  say "=== Injecting bridge contract into ~/.codex/AGENTS.md ==="
+
+  AGENTS_FILE="$HOME/.codex/AGENTS.md"
+  CONTRACT_SOURCE="$BRIDGE_PATH/system-instruction/smux-skill.md"
+
+  if [[ ! -f "$CONTRACT_SOURCE" ]]; then
+    say "  WARN: $CONTRACT_SOURCE missing — bridge tree may be incomplete."
+    say "  Skipping AGENTS.md injection. Run after the bridge build lands."
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    say "  [dry-run] would inject ~580 tok bridge contract into $AGENTS_FILE"
+    say "  [dry-run] markered: <!-- codex-pair:begin --> ... <!-- codex-pair:end -->"
+  else
+    run mkdir -p "$(dirname "$AGENTS_FILE")"
+    python3 - "$AGENTS_FILE" "$CONTRACT_SOURCE" <<'PY'
+import sys, re, os
+agents_path, source_path = sys.argv[1], sys.argv[2]
+
+with open(source_path) as f:
+    contract = f.read().rstrip() + "\n"
+
+begin = "<!-- codex-pair:begin (managed by ~/.claude/skills/codex-pair/install.sh — do not edit between markers) -->"
+end = "<!-- codex-pair:end -->"
+section = f"{begin}\n\n{contract}\n{end}\n"
+
+existing = ""
+if os.path.exists(agents_path):
+    with open(agents_path) as f:
+        existing = f.read()
+
+# Match our managed section. Use re.DOTALL so . matches newlines.
+# Anchor on the begin/end markers; don't assume any specific surrounding
+# whitespace — that lets the user reflow their own content around us.
+managed_re = re.compile(
+    re.escape(begin) + r".*?" + re.escape(end),
+    re.DOTALL,
+)
+m = managed_re.search(existing)
+
+if m:
+    # Markers present — replace section content between them.
+    if m.group(0).strip() == section.strip():
+        print("  (already injected, unchanged)")
+    else:
+        new_content = existing[:m.start()] + section.rstrip() + existing[m.end():]
+        with open(agents_path, "w") as f: f.write(new_content)
+        print(f"  updated managed section in {agents_path}")
+else:
+    # Markers absent — append. Preserve user's preceding content.
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    if existing and not existing.endswith("\n\n"):
+        existing += "\n"
+    with open(agents_path, "w") as f: f.write(existing + section)
+    if existing.strip():
+        print(f"  appended managed section to {agents_path} (existing user content preserved)")
+    else:
+        print(f"  created {agents_path} with managed section")
+PY
+    say ""
+    say "  Cost note: this section adds ~580 model-visible tokens to every"
+    say "  Codex turn that loads the managed AGENTS.md section, not just"
+    say "  /codex-pair turns. Net positive only if codex-pair cold turns"
+    say "  happen >1.6x per Codex non-pair session."
+    say ""
+    say "  IMPORTANT: running Codex sessions don't see edits until TUI"
+    say "  restart. If you have an active codex pane, exit it ('codex /exit'"
+    say "  or kill the pane) and re-spawn for changes to apply."
+  fi
+  say ""
+else
+  say "=== Skipping AGENTS.md injection (--skip-agents) ==="; say ""
 fi
 
 # --- Done -----------------------------------------------------------------
