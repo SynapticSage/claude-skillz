@@ -788,19 +788,22 @@ Construct `TAGGED_PROMPT`:
 
 Then call the bridge tools in order:
 
-1. **Verify the Codex pane is still present:**
-   - `tmux_list()` → confirm an entry whose `target` matches
-     `$CODEX_PANE_ID`. If absent, delete the just-created pending
-     file and fall through to error handling.
-2. **Read to satisfy the bridge's read-before-act guard:**
-   - `tmux_read(target=$CODEX_PANE_ID, lines=20)`.
-3. **Send the tagged prompt:**
+1. **Read to satisfy the bridge's read-before-act guard:**
+   - `tmux_read(target=$CODEX_PANE_ID, lines=5)`. (M2 — was
+     `lines=20`; the response isn't semantically used, the call only
+     marks the read-guard so 5 lines is enough.)
+2. **Send the tagged prompt:**
    - `tmux_message(target=$CODEX_PANE_ID, text=TAGGED_PROMPT)`.
-4. **Re-read to verify text landed:**
+   - If the pane is gone, `bridge.message`'s internal
+     `validateTarget` raises a clear error. Catch it, delete the
+     just-created pending file, and fall through to error handling.
+     (M1 — replaces the prior `tmux_list()` pre-check, which cost
+     ~800 tok at 33 panes for redundant validation.)
+3. **Re-read to verify text landed:**
    - `tmux_read(target=$CODEX_PANE_ID, lines=5)`.
-5. **Submit:**
+4. **Submit:**
    - `tmux_keys(target=$CODEX_PANE_ID, keys=["Enter"])`.
-6. **Stop.** End CC's turn with:
+5. **Stop.** End CC's turn with:
    > "Delivered prompt (req-id `$REQ_ID`) to Codex pane
    > `$CODEX_PANE_ID`. Reply will arrive in a new turn — typically
    > 30s–3min."
