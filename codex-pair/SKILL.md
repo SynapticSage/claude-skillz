@@ -501,9 +501,15 @@ BFILE="$SESSION_DIR/bootstrap.json"
 
 # H2: bootstrap-skip TTL. Define once; both gates (outer bash mtime
 # and inner python ts) read this. 30 min lets idle-resume cases
-# (user steps away, comes back) skip the full bootstrap; the
-# tmux_id() health probe in 3A.1.a.x catches stale-tool-surface
-# regressions.
+# (user steps away, comes back) skip the full bootstrap. The
+# round-1-proposed tmux_id() health probe was removed in round 6
+# because it runs on Claude's side of the bridge and returns
+# Claude's pane (%2), not Codex's — wrong process tree, no useful
+# signal. Stale-tool-surface regressions are caught instead by
+# the reply-handler health counter (3A.3.d) — 3 consecutive
+# protocol violations → UNHEALTHY banner → user prompted with
+# /codex-pair --rebootstrap (force fresh handshake) or
+# /codex-pair --phase1 (fall back).
 TTL_S=1800
 
 SKIP_BOOTSTRAP=0
@@ -700,8 +706,44 @@ CORRELATION (important):
   protocol violation.
 
 BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
-  Same as the shrunk preamble's BOOTSTRAP HANDSHAKE block above:
-  tmux_id() → tmux_doctor() → write bootstrap.json via temp+rename.
+  Confirm setup by running a bridge self-test and writing a file Claude
+  will poll for. This proves your MCP tools work end-to-end.
+
+  Step 1: Get your own pane ID via the bridge:
+        my_pane = tmux_id()
+  Step 2: Run the bridge diagnostic:
+        doctor = tmux_doctor()
+  Step 3: Write bootstrap.json via a temp-file + atomic rename so
+          Claude does not see a partial file. **The doctor output is
+          multi-line — embedding it raw in JSON produces invalid JSON
+          (literal newlines in a string).** Use python3 to JSON-encode
+          all string values before writing.
+
+        TMPF="<SESSION_DIR>/bootstrap.json.tmp"
+        FINAL="<SESSION_DIR>/bootstrap.json"
+
+        python3 - <<PY > "$TMPF"
+        import json, datetime
+        # Substitute the literals below with the actual values you
+        # computed in steps 1 and 2.
+        d = {
+            "acked": True,
+            "bootstrap_id": "<BOOTSTRAP_UUID>",
+            "codex_pane_id": "<my_pane from step 1>",
+            "doctor_status": """<full output of doctor from step 2>""",
+            "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        print(json.dumps(d, indent=2))
+        PY
+        mv "$TMPF" "$FINAL"
+
+  python3's json.dumps handles all escaping automatically — newlines in
+  doctor_status become `\n` literals, quotes are escaped, etc. The
+  resulting bootstrap.json parses cleanly.
+
+  Do this BEFORE acknowledging via tmux_message or waiting for input.
+  The file write IS the acknowledgement. Do not use tmux_message for
+  the ACK — Claude waits on the file, not a message.
 
 LABELING (cosmetic, AFTER bootstrap ACK):
   tmux_read(target=tmux_id()); tmux_name(target=tmux_id(), label="codex-<WINDOW_ID>")
