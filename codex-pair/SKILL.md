@@ -461,13 +461,28 @@ to a different pane fails predicate (2) and triggers full rebootstrap.
 
 **TTL** is defined once as `$TTL_S` and applied to *both* freshness
 gates (the outer `mtime` check and the inner predicate-4 `ts` check)
-so they can't drift. Cold turns saved by extending the TTL are paid
-back by a cheap `tmux_id()` health probe in 3A.1.a.x — that catches
-the stale-tool-surface case (Codex restart with the bridge unloaded,
-config drift, tmux server restart with pane-id reuse). Credit:
-Codex round-1 review HIGH on H2 / 2026-05-02. (H2 — was 5 min, now
-30 min. Per-turn cost of probe ~10 tok; amortized across ~15× more
-hot turns vs. before.)
+so they can't drift. H2 — was 5 min, now 30 min. This amortizes the
+~990-tok cold-path bootstrap across ~15× more turns for the
+idle-resume case.
+
+**Stale-tool risk and recovery.** The 30-min skip relies on the
+cached `doctor_status` from a prior bootstrap. It can mask Codex-side
+MCP tool loss (Codex restarted without the bridge), config drift, or
+tmux-server restart with pane-id reuse. Codex round-1 originally
+proposed a `tmux_id()` health probe to detect these, but the probe
+as designed runs on **Claude's** side of the bridge and returns
+Claude's pane, not Codex's — wrong process tree (Codex round-6
+review HIGH, 2026-05-10). The probe was removed.
+
+In place of the probe, two layers of defense handle stale tools:
+1. The existing reply-handler health counter (3A.3.d) already
+   detects when Codex stops responding correctly: 3 consecutive
+   protocol violations → UNHEALTHY banner → user prompted with
+   `/codex-pair --phase1` (fallback) or `/codex-pair --rebootstrap`
+   (force fresh handshake).
+2. Document `/codex-pair --rebootstrap` as the recovery flag in any
+   bootstrap-related error message. The user can always force a
+   fresh bootstrap manually if they suspect Codex-side breakage.
 
 ```bash
 set -euo pipefail
@@ -532,37 +547,9 @@ fi
 echo "SKIP_BOOTSTRAP=$SKIP_BOOTSTRAP"
 ```
 
-If `SKIP_BOOTSTRAP=1`, run 3A.1.a.x (the probe) before jumping to
-3A.2. Otherwise (file-check predicates failed, or freshness expired)
-fall through to 3A.1.b for a full rebootstrap.
-
-#### 3A.1.a.x — Cheap health probe on the skip path
-
-The 4-predicate check in 3A.1.a verifies the *cached* bootstrap state.
-Predicate 3 (`Status: OK` in `doctor_status`) checks the doctor output
-captured during the *previous* bootstrap, not the current state. With
-the TTL extended to 30 min, that cache can mask Codex-side MCP tool
-loss, config drift, or pane-id reuse after a tmux server restart.
-
-Mitigation: when `SKIP_BOOTSTRAP=1`, call `tmux_id()` via the bridge
-**once** as a current-state probe. Two outcomes:
-
-- `tmux_id()` returns a value matching `$CODEX_PANE_ID` → bridge is
-  healthy on Codex's side, proceed to 3A.2 with `SKIP_BOOTSTRAP=1`.
-- `tmux_id()` errors, returns mismatched value, or times out → force
-  `SKIP_BOOTSTRAP=0`. Surface to the user:
-  > "Phase 5 health probe failed (Codex's bridge tools may have
-  > unloaded). Forcing rebootstrap. If this recurs, try
-  > `/codex-pair --rebootstrap` explicitly or check the pane state."
-  Then fall through to 3A.1.b.
-
-Cost: one MCP call (~10 tok). Catches the stale-tool-surface failure
-mode that the longer TTL otherwise enables.
-
-If you reach this step from a SKIP path and the probe fails, the
-`tmux_id` call's own tool args + response are the cleanup cost — no
-pending file is in flight yet (3A.2.a hasn't run), so no extra
-state to delete.
+If `SKIP_BOOTSTRAP=1`, jump to 3A.2. Otherwise (file-check predicates
+failed, or freshness expired) fall through to 3A.1.b for a full
+rebootstrap.
 
 #### 3A.1.b — Compose and deliver the bootstrap preamble
 
@@ -570,17 +557,35 @@ H1 from token-optimization: the **static** bridge contract (Read-Act-
 Read cycle, never poll, pane-ID routing, tool quick-reference) is
 loaded into Codex's context once at TUI startup via the managed section
 of `~/.codex/AGENTS.md` (written by `install.sh`'s `--skip-agents`
-gated step). The per-turn preamble below carries only the **dynamic**
-bits that change per-turn: this turn's `BOOTSTRAP_UUID`, the CC pane
-ID, the session-dir path, the file-ACK protocol, correlation tags,
-and labeling commands. Net per-cold-turn savings: ~370 tok.
+gated step). When that section is present, the per-turn preamble below
+carries only the **dynamic** bits: this turn's `BOOTSTRAP_UUID`, the CC
+pane ID, the session-dir path, the file-ACK protocol, correlation
+tags, and labeling commands. Net per-cold-turn savings: ~370 tok.
 
-If `~/.codex/AGENTS.md` is missing the managed section (e.g. user
-hasn't run `install.sh`), Codex won't know the static contract and
-this preamble alone is insufficient. Symptom: bootstrap ACKed but
-later replies don't include `[reply-to:...]` tags or come from the
-wrong pane. Recovery: re-run `~/.claude/skills/codex-pair/install.sh`
-and exit/respawn the codex pane (TUI reload).
+**Runtime guard (Codex round-6 review MEDIUM, 2026-05-10).** Before
+composing the preamble, check whether `~/.codex/AGENTS.md` contains
+the codex-pair managed section. The pane may have started before
+`install.sh` ran, so AGENTS.md presence on disk alone is not enough
+to guarantee Codex's context has the contract loaded — but it's the
+cheapest signal we have:
+
+```bash
+AGENTS_FILE="$HOME/.codex/AGENTS.md"
+if [ -f "$AGENTS_FILE" ] && grep -q '<!-- codex-pair:begin' "$AGENTS_FILE"; then
+  PREAMBLE_MODE="shrunk"   # AGENTS.md has our section, assume Codex loaded it
+else
+  PREAMBLE_MODE="legacy"   # AGENTS.md missing or unmarkered, send full contract
+fi
+echo "PREAMBLE_MODE=$PREAMBLE_MODE"
+```
+
+Two preambles below. Use `PREAMBLE_MODE` to pick which one to deliver.
+If a user reports replies missing `[reply-to:...]` tags or coming from
+the wrong pane after install, the fix is: re-run
+`~/.claude/skills/codex-pair/install.sh` and exit/respawn the codex
+pane (TUI reload). The runtime guard catches the missing-AGENTS.md
+case; the user respawn handles the AGENTS.md-installed-but-pane-stale
+case.
 
 Generate a `BOOTSTRAP_UUID` (8-hex), then compose the preamble Codex
 must read. The preamble instructs Codex to:
@@ -592,6 +597,8 @@ must read. The preamble instructs Codex to:
 Send via bracketed paste (same mechanism as Phase 1 — see Step 3B.1),
 then Enter. Substitute `<CC_PANE>`, `<BOOTSTRAP_UUID>`, `<SESSION_DIR>`
 with concrete values from this turn:
+
+##### If `PREAMBLE_MODE=shrunk` (AGENTS.md has the managed marker):
 
 ```
 You are paired with Claude Code in tmux pane <CC_PANE>.
@@ -654,6 +661,59 @@ LABELING (cosmetic, AFTER bootstrap ACK):
 
 Wait for the user's actual prompt in the next message (it will contain a [req:<uuid>] tag).
 ```
+
+##### If `PREAMBLE_MODE=legacy` (AGENTS.md missing managed marker — full contract inline):
+
+The shrunk preamble assumes Codex has the bridge contract loaded
+from `~/.codex/AGENTS.md`. If the runtime guard found no managed
+marker, fall back to delivering the full contract inline. Costs
+~990 tok per cold turn (same as pre-H1) but guaranteed to work
+without install.sh having run.
+
+```
+You are paired with Claude Code in tmux pane <CC_PANE>.
+You have MCP tools from `tmux-bridge` for cross-pane messaging.
+
+Contract:
+  1. Read before write. Always call tmux_read(target) before tmux_type,
+     tmux_message, or tmux_keys on that target.
+  2. Read-Act-Read cycle. After typing, read again to verify text landed,
+     then send Enter via tmux_keys.
+  3. Never poll for replies. Claude will push new prompts into YOUR pane
+     with a [tmux-bridge from:claude ...] header; you receive them as
+     ordinary input.
+  4. To reply to Claude, call:
+        tmux_read(target="<CC_PANE>")
+        tmux_message(target="<CC_PANE>", text=YOUR_RESPONSE)
+        tmux_read(target="<CC_PANE>")
+        tmux_keys(target="<CC_PANE>", keys=["Enter"])
+
+CORRELATION (important):
+  Every prompt Claude sends you will be tagged with a line like
+  [req:<8-char-uuid>] at the start of the message body. When you reply,
+  YOUR_RESPONSE must include the corresponding line:
+        [reply-to:<8-char-uuid>]
+  on its own line in your response (anywhere — header or footer is fine).
+  Match the uuid exactly to the [req:...] tag on the prompt you are
+  answering. Without this, Claude cannot match your reply to the right
+  pending request and will treat your message as unsolicited or as a
+  protocol violation.
+
+BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
+  Same as the shrunk preamble's BOOTSTRAP HANDSHAKE block above:
+  tmux_id() → tmux_doctor() → write bootstrap.json via temp+rename.
+
+LABELING (cosmetic, AFTER bootstrap ACK):
+  tmux_read(target=tmux_id()); tmux_name(target=tmux_id(), label="codex-<WINDOW_ID>")
+  tmux_read(target="<CC_PANE>"); tmux_name(target="<CC_PANE>", label="claude-<WINDOW_ID>")
+
+Upstream full contract reference:
+  cat ~/.claude/skills/codex-pair/vendor/tmux-bridge-mcp/system-instruction/smux-skill.md
+
+Wait for the user's actual prompt in the next message (it will contain a [req:<uuid>] tag).
+```
+
+##### Delivery (both modes)
 
 Substitute `<CC_PANE>`, `<BOOTSTRAP_UUID>`, `<SESSION_DIR>` with their
 values, then deliver via the bracketed-paste mechanism in Step 3B.1

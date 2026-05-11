@@ -675,11 +675,13 @@ if os.path.exists(agents_path):
     with open(agents_path) as f:
         existing = f.read()
 
-# Match our managed section. Use re.DOTALL so . matches newlines.
-# Anchor on the begin/end markers; don't assume any specific surrounding
-# whitespace — that lets the user reflow their own content around us.
+# Match our managed section. Anchor on the STABLE prefix of the begin
+# marker, not the full canonical text — that way if a user edits the
+# parenthetical (or we change it across versions), we still recognize
+# the section and replace in place instead of appending a duplicate.
+# Codex round-6 review MEDIUM, 2026-05-10.
 managed_re = re.compile(
-    re.escape(begin) + r".*?" + re.escape(end),
+    r"<!-- codex-pair:begin.*?" + re.escape(end),
     re.DOTALL,
 )
 m = managed_re.search(existing)
