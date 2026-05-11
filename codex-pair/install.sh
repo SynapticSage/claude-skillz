@@ -459,22 +459,35 @@ PY
       #                  Skip — don't fail, don't double-apply.
       #   any other failure: hunks don't match → upstream moved underneath us.
       #                  Fail loud so we can revisit the patch, never partially apply.
+      # Non-interactive patch invocation. Two reasons:
+      #
+      # 1. Stdin is /dev/null so `patch` can never read interactive prompt
+      #    responses from a fallback /dev/tty (BSD patch's default on
+      #    macOS), which would hang the installer when the bridge tree
+      #    already has the patch applied.
+      # 2. --batch / --force tells patch to accept defaults silently:
+      #    skip already-applied hunks, refuse reverse, no prompts.
+      #
+      # Patch content comes via `-i $PATCH_FILE` instead of stdin
+      # redirection so stdin can be closed. The "Reversed (or previously
+      # applied)" detection text still appears in stdout — that's what
+      # the grep below relies on.
       DRY_LOG=$(mktemp)
-      if (cd "$BRIDGE_PATH" && patch -p1 --dry-run --check < "$PATCH_FILE") >"$DRY_LOG" 2>&1; then
+      if (cd "$BRIDGE_PATH" && patch -p1 --dry-run --check --batch -i "$PATCH_FILE" </dev/null) >"$DRY_LOG" 2>&1; then
         DRY_RC=0
       else
         DRY_RC=$?
       fi
       DRY_OUT=$(cat "$DRY_LOG")
       rm -f "$DRY_LOG"
-      if printf '%s' "$DRY_OUT" | grep -q 'Reversed.*previously applied'; then
+      if printf '%s' "$DRY_OUT" | grep -q 'Reversed.*previously applied\|already exists'; then
         say "  format-patch already applied (skipping)"
       elif [[ $DRY_RC -eq 0 ]]; then
-        if (cd "$BRIDGE_PATH" && patch -p1 < "$PATCH_FILE" >/dev/null 2>&1); then
+        if (cd "$BRIDGE_PATH" && patch -p1 --batch -i "$PATCH_FILE" </dev/null >/dev/null 2>&1); then
           say "  applied: 0001-fix-self-context.patch (Bridge-A + Bridge-B)"
         else
           say "  ERROR: format-patch dry-run passed but apply failed."
-          say "  Inspect: cd $BRIDGE_PATH && patch -p1 < $PATCH_FILE"
+          say "  Inspect: cd $BRIDGE_PATH && patch -p1 --batch -i $PATCH_FILE </dev/null"
           exit 1
         fi
       else
