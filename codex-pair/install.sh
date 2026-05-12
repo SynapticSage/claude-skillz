@@ -459,31 +459,38 @@ PY
       #                  Skip — don't fail, don't double-apply.
       #   any other failure: hunks don't match → upstream moved underneath us.
       #                  Fail loud so we can revisit the patch, never partially apply.
-      # Non-interactive patch invocation. Two reasons:
+      # Non-interactive AND non-destructive patch invocation. Three things:
       #
       # 1. Stdin is /dev/null so `patch` can never read interactive prompt
       #    responses from a fallback /dev/tty (BSD patch's default on
       #    macOS), which would hang the installer when the bridge tree
       #    already has the patch applied.
-      # 2. --batch / --force tells patch to accept defaults silently:
-      #    skip already-applied hunks, refuse reverse, no prompts.
-      #
-      # Patch content comes via `-i $PATCH_FILE` instead of stdin
-      # redirection so stdin can be closed. The "Reversed (or previously
-      # applied)" detection text still appears in stdout — that's what
-      # the grep below relies on.
+      # 2. --forward (-N) tells patch to IGNORE reversed/already-applied
+      #    patches silently. Critically, --batch is the WRONG flag here:
+      #    --batch takes the default response to "Assume -R? [y]" which
+      #    means it would silently REVERSE an already-applied patch,
+      #    destroying the previous install's work. Observed live
+      #    2026-05-11. --forward is the opposite: never un-apply.
+      # 3. Patch content comes via `-i $PATCH_FILE` instead of stdin
+      #    redirection so stdin can be closed. The "Reversed (or
+      #    previously applied)" detection text still appears in stdout —
+      #    that's what the grep below relies on for the "skipping" branch.
       DRY_LOG=$(mktemp)
-      if (cd "$BRIDGE_PATH" && patch -p1 --dry-run --check --batch -i "$PATCH_FILE" </dev/null) >"$DRY_LOG" 2>&1; then
+      if (cd "$BRIDGE_PATH" && patch -p1 --dry-run --check --forward -i "$PATCH_FILE" </dev/null) >"$DRY_LOG" 2>&1; then
         DRY_RC=0
       else
         DRY_RC=$?
       fi
       DRY_OUT=$(cat "$DRY_LOG")
       rm -f "$DRY_LOG"
-      if printf '%s' "$DRY_OUT" | grep -q 'Reversed.*previously applied\|already exists'; then
+      # Detect "already applied" across both BSD patch output variants:
+      #   --forward says: "Ignoring previously applied (or reversed) patch."
+      #   prompt-style:   "Reversed (or previously applied) patch detected!"
+      #   new-file case:  "patch creates file ... that already exists"
+      if printf '%s' "$DRY_OUT" | grep -qE 'previously applied|already exists'; then
         say "  format-patch already applied (skipping)"
       elif [[ $DRY_RC -eq 0 ]]; then
-        if (cd "$BRIDGE_PATH" && patch -p1 --batch -i "$PATCH_FILE" </dev/null >/dev/null 2>&1); then
+        if (cd "$BRIDGE_PATH" && patch -p1 --forward -i "$PATCH_FILE" </dev/null >/dev/null 2>&1); then
           say "  applied: 0001-fix-self-context.patch (Bridge-A + Bridge-B)"
         else
           say "  ERROR: format-patch dry-run passed but apply failed."
@@ -495,6 +502,28 @@ PY
         say "  Upstream likely moved. Revisit $PATCH_FILE."
         say "  patch dry-run output (rc=$DRY_RC):"
         printf '%s\n' "$DRY_OUT" | sed 's/^/    /'
+        exit 1
+      fi
+
+      # Post-apply verification (defense against BSD patch --batch
+      # silently skipping hunks on a partially-applied tree — observed
+      # 2026-05-11 when a prior install stalled on /dev/tty, left vendor
+      # half-patched, and the re-run with --batch reported "applied"
+      # while actually no-op'ing on the unmatched hunks).
+      #
+      # Sentinels: the patch adds getSelfContext() (Bridge-A/B fix) and
+      # bumps version to 0.3.1. Both must be present after the apply
+      # branch OR the "already applied (skipping)" branch.
+      if ! grep -q 'getSelfContext' "$BRIDGE_PATH/src/tmux-bridge.ts" 2>/dev/null \
+         || ! grep -q '"version": "0.3.1"' "$BRIDGE_PATH/package.json" 2>/dev/null; then
+        say ""
+        say "  ERROR: format-patch verification FAILED — sentinels missing."
+        say "    Missing one or both:"
+        say "      - getSelfContext in $BRIDGE_PATH/src/tmux-bridge.ts"
+        say "      - version 0.3.1 in $BRIDGE_PATH/package.json"
+        say "    Likely cause: BSD patch --batch silently skipped hunks on a"
+        say "    partial-apply tree. Recovery:"
+        say "      rm -rf '$BRIDGE_PATH' && re-run install.sh  (fresh clone)"
         exit 1
       fi
     fi
