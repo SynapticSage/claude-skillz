@@ -311,13 +311,97 @@ Internal flow:
 7. **Phase 6** — steelman both sides.
 8. **Phase 7** — synthesize (five verdict categories + final ledger + dual calibration) and write to `<original-name>-adversarial-results.md`.
 
-## Optional: enforce the loop in code
+## Optional: enforce the loop in code (Workflow mode)
 
-When the `Workflow` tool is available, the convergence loop can be run as a
+When the `Workflow` tool is available, run the convergence loop as a
 deterministic script instead of by orchestrator judgment — the ledger becomes a
-data structure and the stop/re-open rules become literal loop predicates. See the
-Workflow-mode section (added by T3-A2) when present; otherwise use the plain Agent
-orchestration above.
+data structure and the stop/re-open rules become literal `while`-loop
+predicates, so "motivated stopping" is impossible. Invoking this mode is an
+explicit opt-in to multi-agent orchestration.
+
+Do the Phase 0 claim extraction inline first (scout, then fan out), then pass
+the claims as `args` and run this skeleton. It encodes the exact stop/re-open
+rules from [Convergence rules](#convergence-rules):
+
+```javascript
+export const meta = {
+  name: 'adversarial-ledger',
+  description: 'Dispute-resolution stress-test: red-team, counter, rebut, converge by rule',
+  phases: [{ title: 'Red-team' }, { title: 'Counter' }, { title: 'Rebut' }, { title: 'Synthesize' }],
+}
+
+// args: { claims: [{ id, text, assumptions }], facts: "<situation facts>" }
+const claims = args.claims
+const FACTS = args.facts || ''
+
+const DISPUTES = { type: 'object', required: ['disputes'], properties: { disputes: { type: 'array',
+  items: { type: 'object', required: ['claim_id', 'challenge', 'materiality', 'bucket'], properties: {
+    claim_id: { type: 'string' }, challenge: { type: 'string' },
+    type: { enum: ['factual', 'definitional', 'causal', 'legal', 'probabilistic', 'scope'] },
+    materiality: { enum: ['high', 'medium', 'low'] },
+    evidence_quality: { enum: ['direct', 'indirect', 'speculative'] },
+    bucket: { enum: ['substantiated-material', 'plausible-material', 'theoretical', 'out-of-scope'] } } } } } }
+
+const VERDICT = { type: 'object', required: ['status', 'novelty'], properties: {
+  status: { enum: ['unresolved', 'resolved-for', 'resolved-against', 'irreducibly-uncertain'] },
+  novelty: { enum: ['new-evidence', 'new-argument', 'reframing', 'repetition'] },
+  note: { type: 'string' } } }
+
+// Phase 1 — red-team, one agent per claim (barrier: need all before distilling)
+phase('Red-team')
+const red = await parallel(claims.map(c => () =>
+  agent(`Red-team this claim. Find every hole, overstatement, confirmation bias; search for` +
+        ` counterexamples and contradicting evidence.\nClaim: ${c.text}\n` +
+        `Assumptions: ${(c.assumptions || []).join('; ')}\nReturn disputes.`,
+    { label: `red:${c.id}`, phase: 'Red-team', schema: DISPUTES })))
+
+// Phase 2 — distil ledger in plain code: four-bucket filter (keep only material)
+let ledger = red.filter(Boolean).flatMap(r => r.disputes)
+  .filter(d => d.bucket === 'substantiated-material' || d.bucket === 'plausible-material')
+  .map((d, i) => ({ ...d, key: `${d.claim_id}#${i}`, status: 'unresolved', novelty: 'new-argument', note: '' }))
+log(`${ledger.length} material disputes after four-bucket filter`)
+
+// Rounds: counter -> targeted rebuttal -> converge. Hard cap 3.
+let round = 0
+while (round < 3) {
+  round++
+  const live = ledger.filter(d => d.status === 'unresolved' && d.materiality !== 'low')
+  if (!live.length) { log(`round ${round}: no live high/medium disputes — stop`); break }
+
+  // counter then rebut, pipelined per dispute (no barrier between the two stages)
+  const judged = await pipeline(live,
+    d => agent(`Counter this dispute for the specific situation; refute or narrow it. Be honest if` +
+               ` the risk survives.\nFacts: ${FACTS}\nDispute: ${d.challenge}`,
+      { label: `counter:${d.key}`, phase: 'Counter', schema: VERDICT }).then(v => ({ d, counter: v })),
+    ({ d, counter }) => counter.status !== 'unresolved'
+      ? { d, verdict: counter }                                   // resolved — no rebuttal needed
+      : agent(`Given the narrowing, does the concern still materially survive for this decision?\n` +
+              `Dispute: ${d.challenge}\nNarrowing: ${counter.note}\nFacts: ${FACTS}`,
+          { label: `rebut:${d.key}`, phase: 'Rebut', schema: VERDICT }).then(verdict => ({ d, verdict })))
+
+  // Phase 5 — fold verdicts back; re-open ONLY if the round produced new
+  // evidence/argument (reframing/repetition => converge that dispute).
+  let progressed = false
+  for (const j of judged.filter(Boolean)) {
+    const e = ledger.find(x => x.key === j.d.key)
+    const reopen = j.verdict.status === 'unresolved' &&
+                   (j.verdict.novelty === 'new-evidence' || j.verdict.novelty === 'new-argument')
+    e.status = reopen ? 'unresolved'
+             : (j.verdict.status === 'unresolved' ? 'irreducibly-uncertain' : j.verdict.status)
+    e.novelty = j.verdict.novelty; e.note = j.verdict.note || ''
+    if (reopen) progressed = true
+  }
+  if (!progressed) { log(`round ${round}: only reframing/repetition — converged`); break }
+}
+
+phase('Synthesize')
+return { ledger, rounds: round }   // main thread does steelman + writes the synthesis doc
+```
+
+The main thread reads the returned `ledger`, runs the [steelman](#phase-6-steelman-before-synthesis)
+pass, and writes the [Phase 7 synthesis](#phase-7-synthesis). When `Workflow`
+is unavailable, use the plain Agent orchestration above — the phases and rules
+are identical; only the enforcement differs.
 
 ## Harness assumptions
 
