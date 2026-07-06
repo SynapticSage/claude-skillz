@@ -55,6 +55,7 @@ g() { bash "$SCRIPTS_DIR/gate.sh" "$1"; }         # run gate with args
 freshlock() { rm -rf "$SD/lock"; }                # clear single-flight lock
 read_rest()  { cat "$SD/skill-args-rest" 2>/dev/null; }
 read_phase1(){ cat "$SD/flag-phase1" 2>/dev/null; }
+read_exec()  { cat "$SD/flag-exec" 2>/dev/null; }
 read_model() { cat "$SD/flag-model" 2>/dev/null || echo "<none>"; }
 
 echo "== 3. gate.sh flag parser (A4 fix) =="
@@ -81,6 +82,12 @@ check   "model-first → rest kept" "just this" "$(read_rest)"
 freshlock; out=$(g "a plain prompt")
 check   "plain → rest kept" "a plain prompt" "$(read_rest)"
 check   "plain → model cleared" "<none>" "$(read_model)"
+check   "plain → exec=0" "0" "$(read_exec)"
+
+freshlock; out=$(g "--exec --model gpt-5.5 do this")
+check   "exec+model → exec=1"  "1" "$(read_exec)"
+check   "exec+model → model"   "gpt-5.5" "$(read_model)"
+check   "exec+model → rest"    "do this" "$(read_rest)"
 
 echo "== 4. gate.sh lock TTL + pending sweep =="
 rm -rf "$SD/lock"; mkdir "$SD/lock"                   # fresh lock (now)

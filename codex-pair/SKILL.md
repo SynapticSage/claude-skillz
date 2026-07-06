@@ -24,14 +24,19 @@ Each invocation delivers a prompt to that pane and gets Codex's response back.
 State persists in the repo-local `.context/codex-pair/<window-id>/` directory,
 so it survives across skill invocations and CC restarts.
 
-**Two transports**, selected at Step 3 by whether the `tmux-bridge` MCP tools
-are loaded:
+**Three transports.** The two tmux transports are selected at Step 3 by whether
+the `tmux-bridge` MCP tools are loaded; a third, `--exec`, needs no tmux at all:
 
 - **Phase 5 (preferred, bidirectional push):** bridge MCP tools available →
   Codex replies by pushing back into CC's pane, so CC's turn ends cleanly after
   delivering the prompt.
 - **Phase 1 (fallback, one-way pull):** no bridge tools → raw `tmux send-keys` /
   `capture-pane` with sentinel-based extraction.
+- **Exec (tmux-free, synchronous):** `--exec`, or automatically when CC isn't
+  inside tmux → run `codex exec` non-interactively, capture the reply directly,
+  resume the session by thread id. No pane, no bootstrap, no sentinels. See
+  Step 3C. This is the transport a caller like `forward-spec --reviewer
+  codex-pair` wants when there's no tmux.
 
 ## Scripts
 
@@ -67,6 +72,11 @@ Until the user restarts CC with the MCP tools loaded, the skill runs Phase 1
 
 ---
 
+> **Exec mode short-circuit:** if CC is **not** inside tmux (`$TMUX` unset), or
+> the raw args contain `--exec`, skip Steps 0–1 and 3A/3B entirely and go
+> straight to **Step 3C** — the `codex exec` transport needs no tmux, pane,
+> gate, or bootstrap. Everything from Step 0 through 3B is the tmux machinery.
+
 ## Step 0 — Preflight
 
 ```bash
@@ -99,6 +109,7 @@ the prompt):
 | `--reset-pending` | clear pending files + lock, then exit |
 | `--rebootstrap` | clear bootstrap.json + health.json; force a fresh Phase 5 handshake |
 | `--phase1 <prompt>` | force the Phase 1 transport this turn |
+| `--exec <prompt>` | force the tmux-free `codex exec` transport (Step 3C) this turn (persisted to `flag-exec`) |
 | `--model <name> <prompt>` | request a Codex model **at spawn only**; on a reused pane the gate/pane writes a `WARN` that Step 5 surfaces |
 
 The lock releases on reply-handler success (3A.3), `--reset-pending`, or a
@@ -131,7 +142,11 @@ it from a file so multi-line text never has to survive shell quoting.
 
 ## Step 3 — Select transport
 
-Inspect your loaded tools (or `ToolSearch` for `tmux_message tmux_read bridge`):
+First: if `$SESSION_DIR/flag-exec` is `1` (the `--exec` flag) → **Step 3C**.
+(Not-in-tmux was already routed to 3C by the Step 0 short-circuit.)
+
+Otherwise inspect your loaded tools (or `ToolSearch` for `tmux_message
+tmux_read bridge`):
 
 - `mcp__tmux-bridge__tmux_read` / `tmux_message` present → **Step 3A (Phase 5)**.
 - absent → **Step 3B (Phase 1)**.
@@ -255,11 +270,39 @@ bash "$CX/poll-extract.sh" "<END_SENTINEL>"       # → response body (or TIMEOU
 extracts the body between them, and prints it. `TIMEOUT: …` → "Codex didn't
 respond within 5 min. Check pane `$CODEX_PANE`."
 
-## Step 4 — Session resume (stub)
+## Step 3C — Exec transport (tmux-free)
 
-Not implemented. The Phase 5 pane persists across CC restarts via
-`$SESSION_DIR/pane-id`, which reduces the need for `codex exec resume`. Tracked
-in `TODO.md`.
+No pane, gate, bootstrap, or sentinels — a synchronous `codex exec` call that
+captures the reply directly and resumes the session by thread id across turns.
+Write the prompt to a file and run:
+
+```bash
+bash "$CX/exec.sh" "$SESSION_DIR/prompt.txt" [model]
+```
+
+(Outside tmux there is no `$SESSION_DIR`; use any temp file for the prompt.)
+
+- Prints the agent's final message on success → present it verbatim in Step 5
+  with `Transport: codex exec`.
+- `EXEC_FAIL: <reason>` → surface the reason; suggest checking `codex login`
+  and the stderr log under `.context/codex-pair/exec/`.
+
+State lives in `$REPO_ROOT/.context/codex-pair/exec/` (`thread-id`,
+`last-message.txt`, `events.jsonl`). The first call starts a Codex session;
+later calls resume it by `thread-id`, so continuity works without a live pane.
+To start fresh, delete `.context/codex-pair/exec/thread-id`. The optional 2nd
+arg sets the model — unlike `--model` on a pane, it applies to every call.
+
+Verified against codex-cli 0.139.0 (2026-07-06): `-o` captures the final
+message, the session id is the JSONL top-level `thread_id`, and `resume <id>`
+carries prior context.
+
+## Step 4 — Session resume
+
+For the **exec** transport this is implemented — Step 3C resumes by `thread-id`.
+For the **pane** transports it remains a stub: the pane itself persists across
+CC restarts via `$SESSION_DIR/pane-id`, which reduces the need for
+`codex exec resume` there. Tracked in `TODO.md`.
 
 ## Step 5 — Present the response
 
@@ -333,7 +376,8 @@ separate paragraph **after** the block — never edit Codex's words inside it.
 
 ## What this skill does NOT do (yet)
 
-- **Cold-start `codex exec resume`** on dead-pane respawn (Step 4 stub).
+- **`codex exec resume` for the pane transports** on dead-pane respawn — the
+  exec transport (3C) resumes by thread id, but the pane transports don't.
 - **Readiness probe** after spawn — blind `sleep 4` in `pane.sh`.
 - **Kernel-level serialization** — single-flight is policy-enforced by the gate
   lock, not an OS lock across CC processes.
@@ -345,7 +389,8 @@ See `TODO.md` for the full open-issues list with severity and line references.
 ## Harness assumptions
 
 Verified against Claude Code as of 2026-07-06. This skill assumes:
-- Claude Code runs inside a tmux pane; `tmux` and the `codex` CLI are on PATH.
-- Phase 5 transport additionally requires the `tmux-bridge` MCP tools to be loaded (see First-time setup).
+- The `codex` CLI is on PATH (always).
+- The pane transports (Phase 1/5) require CC to run inside a tmux pane with `tmux` on PATH; Phase 5 additionally needs the `tmux-bridge` MCP tools loaded (see First-time setup).
+- The `--exec` transport (Step 3C) needs neither tmux nor the bridge — just `codex`.
 
 If a listed tool name or behavior no longer matches the live harness, fix this skill before trusting it.

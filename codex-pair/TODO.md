@@ -166,4 +166,19 @@ previously had to be fixed in every block (the #15/#16 bug class).
 | Sev | Item | Note |
 |---|---|---|
 | LOW | `datetime.datetime.utcnow()` in `bootstrap-check.sh` / `ack-wait.sh` / `health-update.sh` is deprecated (Py 3.12+) and emits a stderr DeprecationWarning | Carried over faithfully from the inline code — NOT a regression. Replace with `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)` (stays naive-UTC, so the `strptime` comparisons keep working) when convenient |
-| LOW | No live end-to-end smoke test was run for the extraction | The unit tests stub tmux; a real `/codex-pair` round-trip (Phase 1 + Phase 5) inside a tmux + codex environment should be run before relying on the rewrite in anger |
+| LOW | No live end-to-end smoke test was run for the **pane** transports (Phase 1 / Phase 5) | The unit tests stub tmux; a real `/codex-pair` round-trip through the pane transports inside a tmux + codex environment should still be run before relying on the rewrite in anger. (The **exec** transport, below, WAS live-verified.) |
+
+## Exec transport (2026-07-06, T3-C1)
+
+Added a third, tmux-free transport (`scripts/exec.sh`, `--exec` flag, SKILL.md
+Step 3C) built on `codex exec`. Removes the hard tmux requirement — a caller
+like `forward-spec --reviewer codex-pair` can now get a Codex reply with no
+pane. **Live-verified** against codex-cli 0.139.0: `-o` captures the final
+message; the session id is the JSONL top-level `thread_id`; `codex exec resume
+<thread_id>` carries prior context (confirmed with a two-call recall test);
+`exec.sh` round-trips end to end. Selected automatically when not in tmux, or
+forced with `--exec`. State in `.context/codex-pair/exec/`.
+
+Open: the thread-id parser keys on `thread_id` — if a future codex-cli renames
+that JSONL field, resume silently starts fresh (safe degrade, but continuity
+breaks until the parser is updated).

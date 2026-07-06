@@ -28,6 +28,7 @@ SKILL_ARGS="${1:-${SKILL_ARGS:-}}"
 FLAG_RESET_PENDING=0
 FLAG_REBOOTSTRAP=0
 FLAG_PHASE1=0
+FLAG_EXEC=0
 MODEL_OVERRIDE=""
 
 REST="$SKILL_ARGS"
@@ -39,6 +40,8 @@ while [ -n "$REST" ]; do
     "--rebootstrap "*)    FLAG_REBOOTSTRAP=1;   REST="${REST#--rebootstrap }" ;;
     --phase1)             FLAG_PHASE1=1;        REST="" ;;
     "--phase1 "*)         FLAG_PHASE1=1;        REST="${REST#--phase1 }" ;;
+    --exec)               FLAG_EXEC=1;          REST="" ;;
+    "--exec "*)           FLAG_EXEC=1;          REST="${REST#--exec }" ;;
     --model)              REST="" ;;   # --model with no value: ignore
     "--model "*)          tmp="${REST#--model }"
                           MODEL_OVERRIDE="${tmp%% *}"
@@ -116,6 +119,7 @@ fi
 
 # Persist flag state for downstream steps to read.
 echo "$FLAG_PHASE1"     > "$SESSION_DIR/flag-phase1"
+echo "$FLAG_EXEC"       > "$SESSION_DIR/flag-exec"
 echo "$SKILL_ARGS_REST" > "$SESSION_DIR/skill-args-rest"
 # flag-model: only present when this turn requested an override. Cleared
 # otherwise so a stale override from a previous turn never reanimates.
