@@ -7,7 +7,7 @@ subsequent Phase-5 dev work.
 | # | Severity | Summary | Status |
 |---|---|---|---|
 | 1 | CRITICAL | Poll breaks on the first END (prompt echo), not the second (Codex's emission) — extractor then fails | **FIXED** — poll now requires `-ge 2` END occurrences |
-| 2 | HIGH | No serialization on the shared long-lived pane — concurrent `/codex-pair` invocations race | OPEN — needs flock or busy-marker |
+| 2 | HIGH | No serialization on the shared long-lived pane — concurrent `/codex-pair` invocations race | **PARTIAL** — Step 0.5 gate (`scripts/gate.sh`) provides per-window single-flight via an atomic `mkdir` lock with a 60-min stale TTL. Concurrent invocations in a window now serialize (HOLD) instead of racing. Not a cross-process kernel lock across unrelated CC processes; that remains open |
 | 3 | HIGH | Reuse validation checks "pane exists" but not "this is still Codex and it's idle" | OPEN — add pane-command probe + idle check |
 | 4 | HIGH | `set -u` instead of `set -euo pipefail`; most tmux return values not checked | **FIXED** — all bash blocks now use `set -euo pipefail` |
 | 5 | HIGH | Cold-start `codex exec resume` documented but never implemented | OPEN — Step 4 is now explicitly marked a stub; Phase 5 push model reduces urgency |
@@ -140,3 +140,30 @@ okay with doing that for now. We should take a note that later we
 should clean this up and perhaps be more professional about our
 release path for this feature." Logging that here so the next pass
 through this skill remembers the trigger conditions.
+
+## Script extraction (2026-07-06, T2-C1)
+
+The ~10 inline bash blocks in `SKILL.md` were extracted into `scripts/`
+(shared env logic in `scripts/lib.sh`), shrinking `SKILL.md` from 1,411
+to 351 lines and centralizing the Invariant #9/#10/portability logic that
+previously had to be fixed in every block (the #15/#16 bug class).
+
+- Scripts: `preflight`, `gate`, `pane`, `bootstrap-check`, `ack-wait`,
+  `pending-write`, `reply-validate`, `health-update`, `send-p1`,
+  `poll-extract`, `paste-raw` + `lib.sh`. Each preserves its original
+  stdout contract. Two Codex-facing preambles moved to
+  `preamble-shrunk.txt` / `preamble-legacy.txt`.
+- Tests: `scripts/tests/run.sh` (bash -n, optional shellcheck, 40+ unit
+  assertions with a stubbed tmux). Run it after any script edit.
+- A3 (hardcoded `/opt/homebrew` tmux, BSD-only `stat -f %m`) fixed in
+  `lib.sh` (`command -v` + portable `mtime_s`). A4 (single-flag parser)
+  fixed in `gate.sh` (loop-based, multi-flag). `poll-extract.sh` got a
+  `|| true` on its count-grep to avoid a latent `set -e` abort on zero
+  matches.
+
+### Follow-ups from the extraction
+
+| Sev | Item | Note |
+|---|---|---|
+| LOW | `datetime.datetime.utcnow()` in `bootstrap-check.sh` / `ack-wait.sh` / `health-update.sh` is deprecated (Py 3.12+) and emits a stderr DeprecationWarning | Carried over faithfully from the inline code — NOT a regression. Replace with `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)` (stays naive-UTC, so the `strptime` comparisons keep working) when convenient |
+| LOW | No live end-to-end smoke test was run for the extraction | The unit tests stub tmux; a real `/codex-pair` round-trip (Phase 1 + Phase 5) inside a tmux + codex environment should be run before relying on the rewrite in anger |
