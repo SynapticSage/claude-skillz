@@ -32,9 +32,9 @@ audit findings, proposed changes organized by rollout tier, optional
 diagrams, and (optionally) a reviewer-pressure-tested verdict.
 
 The gold-standard output reference is
-`~/.claude/skills/codex-pair/TOKEN_OPTIMIZATION_RESEARCH.md`. Match its
-structure, citation discipline, and traceability when the inputs warrant
-it.
+`references/exemplar-token-optimization.md` (vendored alongside this
+skill). Match its structure, citation discipline, and traceability when
+the inputs warrant it.
 
 This skill produces an artifact. It is not a chat-style answer.
 
@@ -86,7 +86,7 @@ may come before or after.
 |---|---|---|
 | `--research-agents N` | `2` | Spawn N parallel research subagents in step 2. `0` skips research. |
 | `--review` | off | Pipe the consolidated draft through a reviewer for GO/no-go rounds. |
-| `--reviewer <name>` | `codex-pair` | Reviewer to use when `--review` is set. Currently only `codex-pair` is supported as a built-in. Other values are passed verbatim and the workflow degrades to "ask the user to review manually." |
+| `--reviewer <name>` | `codex-pair` | Reviewer to use when `--review` is set. Two built-ins: `codex-pair` (external-model second opinion; needs tmux + the `codex` CLI) and `adversarial` (self-contained, tmux-free pressure test via the adversarial skill). Other values are passed verbatim and the workflow degrades to "ask the user to review manually." |
 | `--max-rounds N` | `3` | Cap on review rounds. Step 5 stops at GO or at this cap. |
 | `--mermaid` | on | Include mermaid diagrams (glossary, system overview, before/after sequences, rollout tier flowchart, bar chart). |
 | `--no-mermaid` | — | Skip mermaid diagrams. Useful when the consumer's renderer is unknown. |
@@ -214,8 +214,9 @@ reads the verbatim reply.
 
 If `/codex-pair` isn't installed and `--reviewer codex-pair` was
 requested, surface a clear error: "Reviewer `codex-pair` not installed.
-Either install it (`~/.claude/skills/codex-pair/install.sh`) or rerun
-without `--review`." Don't silently skip review.
+Either install it (`~/.claude/skills/codex-pair/install.sh`), switch to
+`--reviewer adversarial` (no tmux/codex needed), or rerun without
+`--review`." Don't silently skip review.
 
 ### Step 5 — Consolidate review feedback
 
@@ -258,7 +259,7 @@ Do NOT paste the doc body into chat — the file IS the deliverable.
 ## Output Structure
 
 Canonical document shape. Reuse the gold-standard
-`TOKEN_OPTIMIZATION_RESEARCH.md` as the implementation reference.
+`references/exemplar-token-optimization.md` as the implementation reference.
 
 ```markdown
 # <Topic> — Forward Spec
@@ -473,9 +474,13 @@ When `--review` is set, send the reviewer this prompt (via
 `<draft-path>` and `<round-number>`.
 
 ```text
+[forward-spec review round <round-number> — <topic-slug>]
 Pressure-test this forward spec for round <round-number>.
 
 Doc: <draft-path> (read it in full).
+
+Begin your reply with the exact marker line above so the workflow can
+correlate your verdict to the right round when it resumes.
 
 Return:
 
@@ -546,15 +551,68 @@ State file shape:
 }
 ```
 
-When the user comes back with Codex's pushed reply, the skill picks up
-the state file, parses the verdict, folds findings, increments `round`,
-and either fires another review request or finalizes.
+### Resuming after a reviewer reply
+
+The reviewer's reply arrives as a fresh message in a later turn (codex-pair
+ends CC's turn after delivery). To resume the round loop:
+
+1. When a presented reviewer reply carries a `[forward-spec review round N —
+   <topic-slug>]` marker, treat it as a review verdict — not an ordinary
+   codex-pair answer.
+2. Locate the workflow state: glob `*/.context/forward-spec/*/state.json`
+   for a record with `status: "awaiting-reply"` whose `<topic-slug>` matches
+   the marker (and `last_req_id`, if the reply exposes one). If none is
+   found, tell the user the review context was lost and ask them to re-run
+   the round rather than guessing.
+3. Reload the draft at `draft_path`, parse the `## Verdict` line, fold the
+   findings into the audit/opportunity sections in place, append the
+   traceability row, and increment `round`.
+4. If the verdict is GO or `round == max_rounds`, finalize (Step 6);
+   otherwise fire the next round's review request and set `status` back to
+   `awaiting-reply`.
+
+This hand-back applies to any reviewer, not just codex-pair.
 
 If the user is invoking this skill in a non-tmux context (no
 `/codex-pair` available), `--review` requires `--reviewer <name>` to be
 something the user can drive manually — the skill will pause at each
 round and ask the user to paste the reviewer's verdict. Document this
-clearly in the round-1 prompt to the user.
+clearly in the round-1 prompt to the user. (Or use `--reviewer
+adversarial`, below, which needs no external tooling.)
+
+---
+
+## Reviewer: adversarial (tmux-free)
+
+When `--reviewer adversarial`, pressure-test the draft with the
+`adversarial` skill instead of an external model. It needs no tmux and no
+`codex` CLI — it runs entirely in-session, so `--review` works everywhere.
+
+Mechanics:
+
+- Treat the draft's **recommended changes** (the tier-organized
+  opportunities plus the recommended rollout order) as the claims under
+  test, and hand them to the adversarial skill as the analysis to
+  stress-test.
+- The adversarial skill returns a synthesis with five verdict categories.
+  Map it to a forward-spec verdict:
+
+  | Adversarial outcome | forward-spec verdict |
+  |---|---|
+  | Any high-materiality recommendation lands in **Failed** | **NO-GO** |
+  | Recommendations land in **Survived only under narrower conditions** (none Failed) | **GO-with-conditions** — one traceability row per narrowing |
+  | All recommendations **Survived unchanged** | **GO** |
+
+- Fold each failed / survived-narrower finding into the relevant
+  audit/opportunity section in place, exactly as with codex-pair, and
+  record it in the reviewer traceability table's `Round N` sub-section.
+- The adversarial skill runs synchronously in-session, so there is no
+  awaiting-reply suspension — but still write `state.json` so a mid-round
+  interruption can resume.
+
+Choosing a reviewer: use `codex-pair` when you want a genuinely external
+model's second opinion (and have tmux + codex); use `adversarial` when you
+want a self-contained pressure test that runs anywhere.
 
 ---
 
@@ -618,6 +676,6 @@ belong, and even there, each row is "what changed in the doc," not
 
 Verified against Claude Code as of 2026-07-06. This skill assumes:
 - Research subagents spawn via the `Agent` tool and run in the background by default; results arrive on completion.
-- `--review --reviewer codex-pair` needs tmux + the `codex` CLI on PATH (driven through the codex-pair skill).
+- `--review` reviewers: `codex-pair` needs tmux + the `codex` CLI on PATH; `adversarial` runs in-session with only the `Agent` tool.
 
 If a listed tool name or behavior no longer matches the live harness, fix this skill before trusting it.
