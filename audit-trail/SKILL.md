@@ -83,6 +83,8 @@ Useful presets:
 | `--code` | `--include summary,files,diff,decisions,tests,risks,next` |
 | `--research` | `--include summary,requests,actions,decisions,risks,next,evidence` |
 
+Precedence: a preset expands first to its `--include` list; an explicit `--include` adds sections on top of it; `--exclude` is applied last and always wins.
+
 ## Output Structure
 
 Use this structure unless flags imply otherwise:
@@ -129,6 +131,8 @@ Keep the language concrete. Prefer "I changed X in file Y and verified with comm
 - If a claim cannot be verified from transcript, tools, files, or sources, label it `not verified`.
 - If the audit trail conflicts with an earlier assistant statement, state the discrepancy instead of smoothing it over.
 - Do not force agreement between the audit trail and the assistant's prior narrative. The audit trail follows evidence.
+- If the transcript has been compacted or summarized, re-verify claimed changes against the filesystem (`git status`, `git diff`, file mtimes) rather than conversational memory before reporting them.
+- Mark any item reconstructed from a summary rather than observed directly as `from summary` in its Evidence cell.
 
 ## Hidden-Reasoning Guardrail
 
@@ -165,13 +169,13 @@ Create or provide a self-contained HTML diagram that visually lays out architect
 - before/after grouping when applicable
 - risk or verification status through restrained badges or color accents
 
-If operating in a writable workspace, write the file as:
+By default, write the file to the session scratchpad directory (fall back to `$TMPDIR`), not the user's workspace:
 
 ```text
-audit-trail-diagram.html
+<scratchpad>/audit-trail-diagram.html
 ```
 
-If that path would overwrite an existing file, use a timestamped or descriptive suffix. If no writable workspace is available, return a fenced `html` block instead.
+Write into the working directory only when the user names a path there; if you do, list the file under **Next Steps** so it can be cleaned up. If that path would overwrite an existing file, use a timestamped or descriptive suffix. If no writable location is available, return a fenced `html` block instead.
 
 After creating an HTML diagram file, run:
 
@@ -201,3 +205,11 @@ When over budget:
 - Do not turn every command into a timestamped log unless requested; this is an audit summary, not a shell transcript.
 - Do not generate diagrams by default.
 - Do not use the audit trail to relitigate the solution. Report what happened; put recommendations under `next` or `risks`.
+
+## Harness assumptions
+
+Verified against Claude Code as of 2026-07-06. This skill assumes:
+- Core tools only (Read, Grep, Bash, Write); it does not spawn subagents.
+- `--html-diagram` writes to the session scratchpad and opens the file with `open` (macOS) — adjust for other platforms.
+
+If a listed tool name or behavior no longer matches the live harness, fix this skill before trusting it.

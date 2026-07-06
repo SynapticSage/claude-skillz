@@ -1408,3 +1408,13 @@ if the bridge updates upstream.
 
 See `TODO.md` in this skill's directory for the full open-issues list
 with severity and line-number references.
+
+---
+
+## Harness assumptions
+
+Verified against Claude Code as of 2026-07-06. This skill assumes:
+- Claude Code runs inside a tmux pane; `tmux` and the `codex` CLI are on PATH.
+- Phase 5 transport additionally requires the `tmux-bridge` MCP tools to be loaded (see First-time setup).
+
+If a listed tool name or behavior no longer matches the live harness, fix this skill before trusting it.

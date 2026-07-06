@@ -5,8 +5,9 @@
 #   1. Verify codex CLI, tmux, node, npm are present.
 #   2. Build tmux-bridge-mcp (npm install + npm run build) — the MCP server
 #      that lets CC and Codex read/write each other's panes.
-#   3. Register the MCP server in Claude Code's settings (project-local by
-#      default; pass --global to write ~/.claude/settings.json instead).
+#   3. Register the MCP server with Claude Code via `claude mcp add -s local`
+#      (or `-s user` when --global is passed). CC's MCP registry lives in
+#      ~/.claude.json; mcpServers entries in settings.json are ignored by CC.
 #   4. Register the MCP server in ~/.codex/config.toml.
 #
 # Flags:
@@ -17,10 +18,12 @@
 #   --skip-patches          don't verify/re-apply local hardening to bridge src
 #   --no-auto-clone         exit with instructions if bridge clone missing,
 #                           instead of auto-cloning from GitHub
-#   --global                write CC's mcpServers entry to ~/.claude/settings.json
-#                           instead of the repo-local .claude/settings.local.json
+#   --global                register with `claude mcp add -s user` (available in
+#                           every project) instead of -s local (this repo only)
 #   --bridge-path PATH      explicit path to tmux-bridge-mcp clone
-#                           (default: <script>/../../../repos/tmux-bridge-mcp)
+#                           (default: <skill>/vendor/tmux-bridge-mcp, falling
+#                           back to the dev layout; auto-clones into vendor/ if
+#                           missing)
 #   --uninstall             remove MCP registrations (does not delete the bridge
 #                           clone or npm artifacts)
 #   --dry-run               print what would happen, make no changes
@@ -64,7 +67,7 @@ while [[ $# -gt 0 ]]; do
     --uninstall)           UNINSTALL=1; shift ;;
     --dry-run)             DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown flag: $1" >&2; exit 2 ;;

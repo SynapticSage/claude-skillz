@@ -20,7 +20,7 @@ allowed-tools:
   - Edit
   - Grep
   - Glob
-  - Task
+  - Agent
   - AskUserQuestion
 ---
 
@@ -131,8 +131,9 @@ exists, suffix with `-2`, `-3`, etc. — never overwrite silently.
 
 If `--research-agents 0`, skip to step 3.
 
-Otherwise spawn N subagents in parallel via the `Task` tool, each with a
-distinct cost-surface / concern / facet to audit. The workflow author
+Otherwise spawn N subagents in parallel via the `Agent` tool, each with a
+distinct cost-surface / concern / facet to audit. Agents run in the
+background by default; their findings arrive on completion. The workflow author
 (you, Claude) chooses the partition based on the topic. Common
 partitions:
 
@@ -421,7 +422,7 @@ the strictest common consumer.
 
 ## Research agent prompt template
 
-When `--research-agents N` > 0, spawn each via the `Task` tool with a
+When `--research-agents N` > 0, spawn each via the `Agent` tool with a
 prompt of this shape. Substitute `<topic>`, `<scope>`, `<facet>`,
 `<files>` from step 1.
 
@@ -526,8 +527,10 @@ When `--reviewer codex-pair` (default), the skill calls the
   delivery; the reply arrives as a fresh user message in a later
   turn. The skill workflow must therefore tolerate being suspended
   between rounds — write the current draft + round counter to
-  `${SESSION_DIR}/forward-spec/<topic-slug>/state.json` so a
-  resumption can pick up.
+  `$FS_STATE_DIR/state.json`, where
+  `FS_STATE_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.context/forward-spec/<topic-slug>"`
+  (mirrors codex-pair's `.context/` convention, including its `.gitignore`
+  handling), so a resumption can pick up.
 
 State file shape:
 
@@ -608,3 +611,13 @@ Evidence: Codex round 1 finding F2.3.
 The reviewer traceability table is the *only* place process notes
 belong, and even there, each row is "what changed in the doc," not
 "how the assistant felt about the change."
+
+---
+
+## Harness assumptions
+
+Verified against Claude Code as of 2026-07-06. This skill assumes:
+- Research subagents spawn via the `Agent` tool and run in the background by default; results arrive on completion.
+- `--review --reviewer codex-pair` needs tmux + the `codex` CLI on PATH (driven through the codex-pair skill).
+
+If a listed tool name or behavior no longer matches the live harness, fix this skill before trusting it.
