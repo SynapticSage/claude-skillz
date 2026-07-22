@@ -3,3 +3,6 @@ adversarial/gpt54crit.md
 codex-pair/vendor/
 # Local fork checkout for the bridge — see codex-pair/TODO.md "patch-on-install"
 tmux-bridge-mcp/
+
+# Codex skill state (pane ID, session ID, transient prompts)
+.context/

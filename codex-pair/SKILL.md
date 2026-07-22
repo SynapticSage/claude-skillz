@@ -72,10 +72,15 @@ Until the user restarts CC with the MCP tools loaded, the skill runs Phase 1
 
 ---
 
-> **Exec mode short-circuit:** if CC is **not** inside tmux (`$TMUX` unset), or
-> the raw args contain `--exec`, skip Steps 0–1 and 3A/3B entirely and go
-> straight to **Step 3C** — the `codex exec` transport needs no tmux, pane,
-> gate, or bootstrap. Everything from Step 0 through 3B is the tmux machinery.
+> **Exec mode short-circuit:** if CC is **not** inside tmux (`$TMUX` unset),
+> skip Steps 0–3B entirely and go straight to **Step 3C** — the `codex exec`
+> transport needs no tmux, pane, gate, or bootstrap.
+>
+> `--exec` **inside** tmux is different: still run Steps 0–0.5 (preflight and
+> the gate), then jump from Step 3 to 3C. The gate is what validates and
+> persists `--model`/`--effort`, and skipping it was how an unvalidated,
+> hand-typed model string reached the API. Only skip the gate when tmux is
+> absent and it *cannot* run.
 
 ## Step 0 — Preflight
 
@@ -86,6 +91,13 @@ bash "$CX/preflight.sh"
 - `MISSING: codex-binary` → stop; relay `npm install -g @openai/codex` + `codex login`.
 - `MISSING: tmux-session` → stop; the skill requires CC running inside tmux.
 - `OK: … session_dir=<path>` → proceed. Remember `session_dir` as `$SESSION_DIR`.
+- `exec_bin=<path>` on the `OK:` line names the codex that supports `codex exec`;
+  `exec_bin=none` means **no** codex here has that subcommand, so Step 3C is
+  unavailable. The pane transports (3A/3B) are unaffected — they only drive the
+  interactive TUI, which every codex major has. If the user forced `--exec` and
+  `exec_bin=none`, stop and relay the `NOTE:` lines rather than falling back
+  silently: a machine with several codex majors installed needs a human decision,
+  not a guess.
 
 ## Step 0.5 — Gate (single-flight + flags)
 
@@ -110,10 +122,46 @@ the prompt):
 | `--rebootstrap` | clear bootstrap.json + health.json; force a fresh Phase 5 handshake |
 | `--phase1 <prompt>` | force the Phase 1 transport this turn |
 | `--exec <prompt>` | force the tmux-free `codex exec` transport (Step 3C) this turn (persisted to `flag-exec`) |
-| `--model <name> <prompt>` | request a Codex model **at spawn only**; on a reused pane the gate/pane writes a `WARN` that Step 5 surfaces |
+| `--model <name>` | override the model (see below) |
+| `--effort <level>` | override the reasoning effort (see below) |
+
+`INVALID_MODEL:` / `INVALID_EFFORT:` → **stop** and relay the message verbatim;
+it already names the valid set. No lock was taken and nothing was sent. Never
+"fix" the value by guessing — ask the user.
 
 The lock releases on reply-handler success (3A.3), `--reset-pending`, or a
 60-min stale TTL.
+
+## Model and effort
+
+**Defaults: `gpt-5.6-sol` at `high` effort.** Both are always passed explicitly
+to `codex` — the skill never lets the pane silently inherit `~/.codex/config.toml`,
+because then "which model answered me?" has no answer at the call site.
+
+| | Values |
+|---|---|
+| `--model` | `gpt-5.2` · `gpt-5.4` · `gpt-5.4-mini` · `gpt-5.5` · **`gpt-5.6-sol`** · `gpt-5.6-terra` · `gpt-5.6-luna` |
+| `--effort` | `low` · `medium` · **`high`** · `xhigh` · `max` · `ultra` |
+
+```
+/codex-pair --model gpt-5.6-sol --effort xhigh  review this diff
+/codex-pair --effort max                        why is this test flaky?
+```
+
+Both are validated in `lib.sh` (`CX_MODELS` / `CX_EFFORTS`) before they reach
+the CLI. That list exists because a wrong string used to sail through to the API
+and die there as an opaque `rc=1`. Three things to know:
+
+- **Effort is not a CLI flag.** `codex` has no `--reasoning-effort`; effort only
+  reaches it as `-c model_reasoning_effort="<level>"`. Because the skill had no
+  effort channel at all, callers smuggled it into the model name
+  (`gpt-5.6-sol-high`) — the bug this whole section exists to prevent. Never put
+  an effort in a model string.
+- **Both are fixed at pane spawn.** On a reused pane the flags are ignored and a
+  `WARN` is written that Step 5 surfaces; kill the pane to switch. The `--exec`
+  transport has no pane, so there they apply to every call.
+- **A new model codex adds will be rejected** by our own list until it's added.
+  `CX_ALLOW_UNKNOWN=1` bypasses; the refresh command is in `lib.sh`.
 
 ## Step 1 — Attach to or spawn the Codex pane
 
@@ -122,9 +170,13 @@ bash "$CX/pane.sh"
 ```
 
 `REUSING: %N` (common path) / `STALE: %N …` (respawned) / `SPAWNED: %N`, then
-`CODEX_PANE=%N FRESH_SPAWN=<0|1>`. Capture `CODEX_PANE`; remember REUSING vs
-SPAWNED for the Step 5 status line. (Bootstrap in 3A.1 runs regardless of
-`FRESH_SPAWN` — it's idempotent.)
+`CODEX_PANE=%N FRESH_SPAWN=<0|1>` and `MODEL=<m> EFFORT=<e>`. Capture all three;
+remember REUSING vs SPAWNED for the Step 5 status line. (Bootstrap in 3A.1 runs
+regardless of `FRESH_SPAWN` — it's idempotent.)
+
+`MODEL`/`EFFORT` are what the pane is **actually running** — on a reused pane
+that's what it was spawned with, not what this turn asked for. Report them
+verbatim in Step 5; don't substitute the requested values.
 
 ## Step 2 — Gather the prompt
 
@@ -277,15 +329,24 @@ captures the reply directly and resumes the session by thread id across turns.
 Write the prompt to a file and run:
 
 ```bash
-bash "$CX/exec.sh" "$SESSION_DIR/prompt.txt" [model]
+bash "$CX/exec.sh" "$SESSION_DIR/prompt.txt"
 ```
 
 (Outside tmux there is no `$SESSION_DIR`; use any temp file for the prompt.)
 
-- Prints the agent's final message on success → present it verbatim in Step 5
-  with `Transport: codex exec`.
-- `EXEC_FAIL: <reason>` → surface the reason; suggest checking `codex login`
-  and the stderr log under `.context/codex-pair/exec/`.
+**Do not pass `--model`/`--effort` here yourself.** Inside tmux the gate already
+validated and persisted them and `exec.sh` reads them; outside tmux the defaults
+apply. Typing them in by hand at this call site is exactly what produced the
+invalid model string. The flags exist (`exec.sh <file> [--model m] [--effort e]`)
+only for a caller with no gate, and they are validated either way.
+
+- Prints the agent's final message on stdout → present it verbatim in Step 5
+  with `Transport: codex exec`. `MODEL=… EFFORT=…` goes to stderr — use it for
+  the Step 5 status line.
+- `EXEC_FAIL: <reason>` → surface the reason; it now carries codex's actual
+  error (pulled from the JSONL event stream, where codex puts API errors — not
+  stderr). Suggest checking `codex login` if it's an auth failure.
+- `INVALID_MODEL:` / `INVALID_EFFORT:` → relay verbatim; nothing was sent.
 
 State lives in `$REPO_ROOT/.context/codex-pair/exec/` (`thread-id`,
 `last-message.txt`, `events.jsonl`). The first call starts a Codex session;
@@ -314,9 +375,15 @@ CODEX SAYS:
 <RESPONSE — verbatim, including Codex's `•` marker if present>
 ════════════════════════════════════════════════════════════
 Pane: <CODEX_PANE> (<REUSING|SPAWNED>)
-Transport: <Phase 5 MCP push | Phase 1 sentinel pull>
+Model: <MODEL> @ <EFFORT> effort
+Transport: <Phase 5 MCP push | Phase 1 sentinel pull | codex exec>
 <contents of $SESSION_DIR/model-warning, if it exists>
 ```
+
+`Model:` is non-negotiable — a second opinion is worth nothing if the reader
+can't tell which model gave it. Use the `MODEL=`/`EFFORT=` values Step 1 (pane)
+or Step 3C (exec, on stderr) reported. On the exec transport there is no pane,
+so drop the `Pane:` line.
 
 If `$SESSION_DIR/model-warning` exists, append its contents verbatim as a line
 inside the block (this is how the `--model` reuse-path warning reaches the
@@ -373,6 +440,11 @@ separate paragraph **after** the block — never edit Codex's words inside it.
 7. **Phase 5 never polls** — CC's turn ends after delivery; Codex pushes back.
 8. **5-minute ceiling on the Phase 1 poll** (in `poll-extract.sh`) — a wedged
    Codex fails cleanly, not hangs CC.
+9. **Model/effort policy lives once in `lib.sh`** (`CX_DEFAULT_MODEL`,
+   `CX_DEFAULT_EFFORT`, `CX_MODELS`, `CX_EFFORTS`, `cx_validate`,
+   `cx_effort_conf`) and **no value reaches `codex` unvalidated.** Never inline
+   a model string, an effort, or a `model_reasoning_effort=` config into a step
+   or a script — that duplication is how `gpt-5.6-sol-high` was born.
 
 ## What this skill does NOT do (yet)
 

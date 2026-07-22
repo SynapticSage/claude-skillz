@@ -38,7 +38,7 @@ BOOTSTRAP HANDSHAKE (do this BEFORE waiting for the next prompt):
             "bootstrap_id": "<BOOTSTRAP_UUID>",
             "codex_pane_id": "<my_pane from step 1>",
             "doctor_status": """<full output of doctor from step 2>""",
-            "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         print(json.dumps(d, indent=2))
         PY

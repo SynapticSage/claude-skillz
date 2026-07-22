@@ -8,9 +8,11 @@
 #   HOLD: ...           → another invocation in flight (exit 0)
 #   STALE_LOCK: ...     → took over an expired lock (continues)
 #   STALE_PENDING: ...  → swept an old pending file (continues)
+#   INVALID_MODEL: ...  → unknown --model/--effort value (exit 0, no lock taken)
+#   INVALID_EFFORT: ...
 #   GATE: clear         → proceed to Step 1
-# Side effects: writes flag-phase1, skill-args-rest, flag-model (or removes
-#   it), removes model-warning, creates lock/.
+# Side effects: writes flag-phase1, flag-exec, skill-args-rest, flag-model /
+#   flag-effort (or removes them), removes model-warning, creates lock/.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 cx_resolve_context
@@ -19,9 +21,15 @@ PENDING_DIR="$SESSION_DIR/pending"
 LOCK_DIR="$SESSION_DIR/lock"
 HEALTH_FILE="$SESSION_DIR/health.json"
 
+# Idempotent, and deliberately NOT relying on preflight having run first: on a
+# virgin session dir the lock `mkdir` below fails, mtime_s returns nothing, the
+# age arithmetic reads as "ancient", and the gate announces a bogus STALE_LOCK
+# before dying on a raw mkdir error. Own the precondition instead of assuming it.
+mkdir -p "$PENDING_DIR"
+
 # --- Flag dispatch (loop-based; fixes A4) ---
 # Consumes leading flags in ANY order and any number, e.g.
-#   --phase1 --model gpt-5.5 fix the bug
+#   --phase1 --model gpt-5.6-sol --effort xhigh fix the bug
 # leaving the prompt text in SKILL_ARGS_REST. The old single-`case` dispatch
 # handled exactly one flag at position zero and swallowed the rest as prompt.
 SKILL_ARGS="${1:-${SKILL_ARGS:-}}"
@@ -30,9 +38,31 @@ FLAG_REBOOTSTRAP=0
 FLAG_PHASE1=0
 FLAG_EXEC=0
 MODEL_OVERRIDE=""
+EFFORT_OVERRIDE=""
+
+# take_value FLAG — pop "--flag <value>" off REST, leaving the rest. Sets VALUE.
+# A valueless --model/--effort is an ERROR, not a shrug: it used to be silently
+# ignored, which meant `--model` alone quietly ran on whatever the pane already
+# had while the user believed they'd switched.
+take_value() {
+  local flag="$1" tmp
+  tmp="${REST#--$flag }"
+  while [ "${tmp# }" != "$tmp" ]; do tmp="${tmp# }"; done   # `--model  x` → `x`
+  VALUE="${tmp%% *}"
+  if [ -z "$VALUE" ] || [ "$VALUE" = "--$flag" ]; then
+    echo "INVALID_$(printf '%s' "$flag" | tr '[:lower:]' '[:upper:]'): --$flag needs a value"
+    exit 0
+  fi
+  if [ "$tmp" = "$VALUE" ]; then REST=""; else REST="${tmp#"$VALUE"}"; fi
+}
 
 REST="$SKILL_ARGS"
 while [ -n "$REST" ]; do
+  # Eat leading spaces every iteration. Without this, `--model x  --effort y`
+  # leaves REST=" --effort y", which matches no case arm, so --effort silently
+  # becomes part of the PROMPT — the same silent-swallow class of bug as A4.
+  while [ "${REST# }" != "$REST" ]; do REST="${REST# }"; done
+  [ -n "$REST" ] || break
   case "$REST" in
     --reset-pending)      FLAG_RESET_PENDING=1; REST="" ;;
     "--reset-pending "*)  FLAG_RESET_PENDING=1; REST="${REST#--reset-pending }" ;;
@@ -42,15 +72,19 @@ while [ -n "$REST" ]; do
     "--phase1 "*)         FLAG_PHASE1=1;        REST="${REST#--phase1 }" ;;
     --exec)               FLAG_EXEC=1;          REST="" ;;
     "--exec "*)           FLAG_EXEC=1;          REST="${REST#--exec }" ;;
-    --model)              REST="" ;;   # --model with no value: ignore
-    "--model "*)          tmp="${REST#--model }"
-                          MODEL_OVERRIDE="${tmp%% *}"
-                          if [ "$tmp" = "$MODEL_OVERRIDE" ]; then REST=""
-                          else REST="${tmp#"$MODEL_OVERRIDE" }"; fi ;;
+    --model|--effort)     echo "INVALID_$(printf '%s' "${REST#--}" | tr '[:lower:]' '[:upper:]'): $REST needs a value"
+                          exit 0 ;;
+    "--model "*)          take_value model;  MODEL_OVERRIDE="$VALUE" ;;
+    "--effort "*)         take_value effort; EFFORT_OVERRIDE="$VALUE" ;;
     *) break ;;   # first non-flag token → start of the prompt
   esac
 done
 SKILL_ARGS_REST="$REST"
+
+# Validate BEFORE the lock: a rejected turn must leave no state behind. This is
+# the guardrail the "invalid model string" bug walked straight past.
+[ -n "$MODEL_OVERRIDE" ]  && { cx_validate model  "$MODEL_OVERRIDE"  || exit 0; }
+[ -n "$EFFORT_OVERRIDE" ] && { cx_validate effort "$EFFORT_OVERRIDE" || exit 0; }
 
 # Handle --reset-pending early and exit cleanly.
 if [ $FLAG_RESET_PENDING -eq 1 ]; then
@@ -121,12 +155,20 @@ fi
 echo "$FLAG_PHASE1"     > "$SESSION_DIR/flag-phase1"
 echo "$FLAG_EXEC"       > "$SESSION_DIR/flag-exec"
 echo "$SKILL_ARGS_REST" > "$SESSION_DIR/skill-args-rest"
-# flag-model: only present when this turn requested an override. Cleared
-# otherwise so a stale override from a previous turn never reanimates.
+# flag-model / flag-effort: present ONLY when this turn asked for an override.
+# Cleared otherwise, so (a) a stale override from a previous turn never
+# reanimates, and (b) pane.sh can distinguish "user asked" (warn on a reused
+# pane) from "took the default" (say nothing). The defaults themselves live in
+# lib.sh and are applied at the spawn/exec site, not here.
 if [ -n "$MODEL_OVERRIDE" ]; then
   printf '%s\n' "$MODEL_OVERRIDE" > "$SESSION_DIR/flag-model"
 else
   rm -f "$SESSION_DIR/flag-model"
+fi
+if [ -n "$EFFORT_OVERRIDE" ]; then
+  printf '%s\n' "$EFFORT_OVERRIDE" > "$SESSION_DIR/flag-effort"
+else
+  rm -f "$SESSION_DIR/flag-effort"
 fi
 # model-warning is per-turn; always clear at the gate so a stale warning
 # can't leak into a turn that didn't request --model.

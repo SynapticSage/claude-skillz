@@ -92,30 +92,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 have pandoc || { echo "MISSING: pandoc (brew install pandoc)"; exit 1; }
 have typst  || { echo "MISSING: typst  (brew install typst)";  exit 1; }
-
-# Optional cloud CLI
-RMAPI_OK=0
-if have rmapi && rmapi version >/dev/null 2>&1; then RMAPI_OK=1; fi
-
-# SSH-USB reachability (cheap probe, 1s timeout)
-SSH_USB_OK=0
-if nc -z -G 1 10.11.99.1 22 2>/dev/null; then SSH_USB_OK=1; fi
-
-# SSH-WiFi reachability (only if user has saved a host)
-SSH_WIFI_OK=0
-SSH_WIFI_HOST=""
-if [ -r "$HOME/.config/remarkable/host" ]; then
-  SSH_WIFI_HOST="$(tr -d '[:space:]' < "$HOME/.config/remarkable/host")"
-  if [ -n "$SSH_WIFI_HOST" ] && nc -z -G 1 "$SSH_WIFI_HOST" 22 2>/dev/null; then
-    SSH_WIFI_OK=1
-  fi
-fi
-
-echo "preflight: rmapi=$RMAPI_OK ssh-usb=$SSH_USB_OK ssh-wifi=$SSH_WIFI_OK host=${SSH_WIFI_HOST:-none}"
+echo "preflight: ok"
 ```
 
-Output one line of preflight to the user so the chosen transport is not
-a surprise.
+Transport reachability is **not** probed here. `upload.sh` (Step 3) probes and
+reports it on its own `PROBE:` line — probing in both places is how the two
+copies drift apart. Convert first; the tablet only has to be reachable at
+upload time.
 
 ---
 
@@ -186,107 +169,38 @@ Markdown). Tell the user which line of the `.typ` to look at.
 
 ---
 
-## Step 3: Upload — Pick Transport
-
-Decision order (when `--transport auto`):
-
-1. `SSH_USB_OK=1` → **SSH-USB**
-2. `SSH_WIFI_OK=1` → **SSH-WiFi**
-3. `RMAPI_OK=1` → **rmapi-cloud**
-4. else → **manual-cloud**
-
-A forced `--transport` jumps straight to that block and errors if
-unavailable (no fallthrough — the user asked for a specific path).
-
-### Transport A — SSH (USB or WiFi)
-
-Same logic for both; only the host differs.
+## Step 3: Upload — Shared Transport Ladder
 
 ```bash
-RM_HOST="${RM_HOST:-10.11.99.1}"            # or $SSH_WIFI_HOST for WiFi
-UUID="$(uuidgen | tr 'A-Z' 'a-z')"
-TS_MS="$(($(date +%s) * 1000))"
-XOCHITL="/home/root/.local/share/remarkable/xochitl"
-
-# 1. Build sidecars locally.
-cat > "$WORK/$UUID.metadata" <<EOF
-{
-  "visibleName": "$NAME",
-  "type": "DocumentType",
-  "parent": "",
-  "deleted": false,
-  "lastModified": "$TS_MS",
-  "metadatamodified": false,
-  "modified": false,
-  "pinned": false,
-  "synced": false,
-  "version": 0
-}
-EOF
-
-cat > "$WORK/$UUID.content" <<EOF
-{
-  "fileType": "pdf",
-  "pageCount": 1,
-  "extraMetadata": {},
-  "lineHeight": -1,
-  "margins": 100,
-  "textScale": 1,
-  "transform": {},
-  "orientation": "portrait"
-}
-EOF
-
-# 2. Push the PDF + sidecars to the tablet.
-scp -q -o ConnectTimeout=4 -o StrictHostKeyChecking=accept-new \
-  "$PDF" "$WORK/$UUID.metadata" "$WORK/$UUID.content" \
-  "root@$RM_HOST:$XOCHITL/" \
-  && ssh -o ConnectTimeout=4 "root@$RM_HOST" \
-       "mv $XOCHITL/$(basename "$PDF") $XOCHITL/$UUID.pdf && systemctl restart xochitl"
+bash ~/.claude/skills/_remarkable/scripts/upload.sh "$PDF" "$NAME" "${TRANSPORT:-auto}" "${FOLDER:-/}"
 ```
 
-Rename-on-device puts the PDF at `<UUID>.pdf` matching the sidecars.
-Restarting `xochitl` re-scans the document store; the doc appears in
-*My Files* within ~5 seconds. The UI flashes during restart — note that
-to the user so they don't think the tablet crashed.
+This logic is **shared with `remarkable-html`** — both skills end in the same
+place, so the ladder lives once in `skills/_remarkable/scripts/upload.sh`. A
+firmware or SSH change is then one edit, not two. Do not inline it back here.
 
-**Auth**: reMarkable's SSH password is set on the device under *Settings
-→ Help → Copyrights and software → GPL Notice → ssh password* (path
-varies by firmware). If `scp` prompts for a password every run, suggest
-the user run `ssh-copy-id root@<host>` once.
+Stdout:
 
-### Transport B — rmapi cloud
+- `PROBE: ssh-usb=… ssh-wifi=… rmapi=… host=…` — relay this so the chosen
+  transport is never a surprise.
+- `UPLOADED: <transport> uuid=<uuid>` — on the tablet. Keep the UUID: it's the
+  handle if the user later wants to rename or delete over SSH.
+- `STAGED: manual <path>` — **not success.** The PDF is on the Desktop and the
+  reMarkable web app is open; the human still has to drag it in.
+- `FAIL: <reason>` — surface verbatim.
 
-```bash
-FOLDER="${FOLDER:-/}"
-rmapi mkdir "$FOLDER" 2>/dev/null || true   # idempotent
-rmapi put "$PDF" "$FOLDER"
-```
+Auto order is SSH-USB → SSH-WiFi → rmapi cloud → manual. An explicit
+`--transport` does **not** fall through: if the user names a path and it's
+unreachable, that's an error worth seeing, not a silent detour.
 
-`rmapi` uploads to reMarkable Cloud; the document appears on the
-tablet after the next sync (seconds on WiFi). If `rmapi` is installed
-but not authenticated, surface the `rmapi help` line that explains the
-one-time `rmapi` (no args) registration flow.
+Two things worth telling the user when they happen:
 
-### Transport C — manual cloud
-
-Last resort. Move the PDF somewhere the user can grab it, open Finder
-to it, open the web app, and tell the user what to drop where.
-
-```bash
-DEST="$HOME/Desktop/$NAME.pdf"
-cp "$PDF" "$DEST"
-open -R "$DEST"                          # reveal in Finder
-open "https://my.remarkable.com/"        # open cloud UI
-```
-
-Tell the user verbatim:
-
-> Drag `$DEST` into the *My Files* area of the open reMarkable web tab.
-> It will sync to the tablet after the next pull.
-
-The reMarkable desktop app accepts the same drag-and-drop if the user
-prefers it over the browser — point to the open Finder window.
+- **The SSH path restarts `xochitl`**, which re-scans the document store. The
+  tablet UI flashes for ~5s and kicks them out of any open notebook. If they're
+  sitting at the tablet mid-sentence, ask first.
+- **First SSH run prompts for a password** (device: *Settings → Help →
+  Copyrights and software → GPL Notice → ssh password*). Don't retry on failure
+  — suggest `ssh-copy-id root@<host>` once.
 
 ---
 

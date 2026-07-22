@@ -39,7 +39,7 @@ if "Status: OK" not in d.get("doctor_status", ""):
     print("FAIL doctor_unhealthy"); sys.exit(0)
 try:
     ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")
-    age = (datetime.datetime.utcnow() - ts).total_seconds()
+    age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - ts).total_seconds()
     # -60s tolerates clock skew.
     if age > ttl_s or age < -60:
         print(f"FAIL ts_stale age={age:.0f} ttl={ttl_s}"); sys.exit(0)

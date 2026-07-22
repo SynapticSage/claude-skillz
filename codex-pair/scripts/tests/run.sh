@@ -57,8 +57,18 @@ read_rest()  { cat "$SD/skill-args-rest" 2>/dev/null; }
 read_phase1(){ cat "$SD/flag-phase1" 2>/dev/null; }
 read_exec()  { cat "$SD/flag-exec" 2>/dev/null; }
 read_model() { cat "$SD/flag-model" 2>/dev/null || echo "<none>"; }
+read_effort(){ cat "$SD/flag-effort" 2>/dev/null || echo "<none>"; }
 
 echo "== 3. gate.sh flag parser (A4 fix) =="
+# Virgin state dir: gate.sh must not assume preflight ran. (The rest of this
+# harness pre-creates $SD/pending, which masked this — found in live testing.)
+VIRGIN="$(mktemp -d)"
+out=$(env REPO_ROOT="$VIRGIN" bash "$SCRIPTS_DIR/gate.sh" "cold start" 2>&1)
+contains "virgin dir → GATE clear"     "GATE: clear" "$out"
+case "$out" in *STALE_LOCK*) fail "virgin dir → bogus STALE_LOCK" ;; *) pass "virgin dir → no bogus STALE_LOCK" ;; esac
+case "$out" in *mkdir*)      fail "virgin dir → raw mkdir error" ;; *) pass "virgin dir → no mkdir error" ;; esac
+rm -rf "$VIRGIN"
+
 freshlock; out=$(g "");
 contains "no-args → GATE clear" "GATE: clear" "$out"
 check   "no-args → phase1=0" "0" "$(read_phase1)"
@@ -88,6 +98,84 @@ freshlock; out=$(g "--exec --model gpt-5.5 do this")
 check   "exec+model → exec=1"  "1" "$(read_exec)"
 check   "exec+model → model"   "gpt-5.5" "$(read_model)"
 check   "exec+model → rest"    "do this" "$(read_rest)"
+
+echo "== 3b. gate.sh model/effort validation (the invalid-model-string bug) =="
+freshlock; out=$(g "--model gpt-5.6-sol --effort xhigh review this")
+check   "model+effort → model"  "gpt-5.6-sol" "$(read_model)"
+check   "model+effort → effort" "xhigh"       "$(read_effort)"
+check   "model+effort → rest"   "review this" "$(read_rest)"
+
+# The regression under test: effort smuggled into the model name, because the
+# model was free text and effort had nowhere else to go.
+freshlock; out=$(g "--model gpt-5.6-sol-high do it")
+contains "smuggled effort → INVALID_MODEL" "INVALID_MODEL:" "$out"
+contains "INVALID_MODEL names the valid set" "gpt-5.6-sol" "$out"
+[ -d "$SD/lock" ] && fail "invalid model took the lock" || pass "invalid model took no lock"
+
+freshlock; out=$(g "--model gpt5.6-sol do it")   # missing hyphen
+contains "typo'd model → INVALID_MODEL" "INVALID_MODEL:" "$out"
+
+freshlock; out=$(g "--effort ultrahigh do it")
+contains "bogus effort → INVALID_EFFORT" "INVALID_EFFORT:" "$out"
+contains "INVALID_EFFORT names the valid set" "xhigh" "$out"
+
+freshlock; out=$(g "--model do it")
+contains "valueless --model → INVALID_MODEL" "INVALID_MODEL:" "$out"
+freshlock; out=$(g "--effort")
+contains "bare --effort → INVALID_EFFORT" "INVALID_EFFORT:" "$out"
+
+freshlock; out=$(CX_ALLOW_UNKNOWN=1 g "--model gpt-6-future do it")
+contains "CX_ALLOW_UNKNOWN bypasses" "GATE: clear" "$out"
+check   "bypass → model persisted" "gpt-6-future" "$(read_model)"
+
+freshlock; out=$(g "no flags at all")
+check   "no flags → model file cleared"  "<none>" "$(read_model)"
+check   "no flags → effort file cleared" "<none>" "$(read_effort)"
+
+# Sloppy spacing must not make a flag vanish into the prompt (the A4 failure
+# class): " --effort max" matches no case arm unless leading spaces are eaten.
+freshlock; out=$(g "--model  gpt-5.5   --effort  max   do it")
+check   "extra spaces → model"  "gpt-5.5" "$(read_model)"
+check   "extra spaces → effort" "max"     "$(read_effort)"
+check   "extra spaces → prompt not polluted" "do it" "$(read_rest)"
+
+echo "== 3c. pane.sh spawn args (defaults reach the codex CLI) =="
+SPAWN_LOG="$WORK/spawn.log"
+p() {  # run pane.sh with a dead pane cache → forces a spawn; returns stdout
+  rm -f "$SD/pane-id" "$SD/pane-model"
+  : > "$SPAWN_LOG"
+  env CX_TEST_SPAWN_LOG="$SPAWN_LOG" CX_TEST_PANES="" CX_SPAWN_SLEEP=0 \
+      CODEX_BIN=/bin/echo bash "$SCRIPTS_DIR/pane.sh"
+}
+
+freshlock; g "just a prompt" >/dev/null      # no --model/--effort → defaults
+out=$(p); log=$(cat "$SPAWN_LOG")
+contains "default spawn → gpt-5.6-sol" "--model gpt-5.6-sol" "$log"
+contains "default spawn → effort high"  'model_reasoning_effort="high"' "$log"
+contains "default spawn → -c carries effort" "-c model_reasoning_effort" "$log"
+contains "pane.sh reports model" "MODEL=gpt-5.6-sol EFFORT=high" "$out"
+
+freshlock; g "--model gpt-5.5 --effort max go" >/dev/null
+out=$(p); log=$(cat "$SPAWN_LOG")
+contains "override spawn → gpt-5.5" "--model gpt-5.5" "$log"
+contains "override spawn → effort max" 'model_reasoning_effort="max"' "$log"
+contains "pane.sh reports override" "MODEL=gpt-5.5 EFFORT=max" "$out"
+
+# Reused pane: report what it's RUNNING, not what this turn would have launched.
+freshlock; g "--model gpt-5.5 --effort max go" >/dev/null
+out=$(p)                                          # spawn %9, records pane-model
+freshlock; g "--model gpt-5.2 second turn" >/dev/null
+out=$(env CX_TEST_PANES="%9" CX_SPAWN_SLEEP=0 CODEX_BIN=/bin/echo \
+      bash "$SCRIPTS_DIR/pane.sh" 2>/dev/null)
+contains "reuse → REUSING" "REUSING: %9" "$out"
+contains "reuse reports the SPAWNED model, not the requested one" "MODEL=gpt-5.5 EFFORT=max" "$out"
+contains "reuse → warning written" "--model gpt-5.2" "$(cat "$SD/model-warning" 2>/dev/null)"
+
+# ...but the defaults must NOT trip that warning, or every reuse turn nags.
+freshlock; g "plain prompt, no flags" >/dev/null
+out=$(env CX_TEST_PANES="%9" CX_SPAWN_SLEEP=0 CODEX_BIN=/bin/echo \
+      bash "$SCRIPTS_DIR/pane.sh" 2>/dev/null)
+[ -e "$SD/model-warning" ] && fail "default reuse wrongly warned" || pass "default reuse is silent"
 
 echo "== 4. gate.sh lock TTL + pending sweep =="
 rm -rf "$SD/lock"; mkdir "$SD/lock"                   # fresh lock (now)
@@ -138,7 +226,7 @@ mk_bootstrap() {  # <pane> <bootstrap_id> <status> <age_seconds>
   python3 -W ignore - "$SD/bootstrap.json" "$1" "$2" "$3" "$4" <<'PY'
 import json, sys, datetime
 path, pane, bid, status, age = sys.argv[1:6]
-ts = datetime.datetime.utcnow() - datetime.timedelta(seconds=int(age))
+ts = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(seconds=int(age))
 json.dump({"acked": True, "bootstrap_id": bid, "codex_pane_id": pane,
            "doctor_status": status,
            "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}, open(path, "w"))
@@ -173,6 +261,83 @@ echo "== 8. preflight.sh (tmux-session branch) =="
 # TMUX. env -u TMUX guarantees it's unset inside preflight.
 out=$(env -u TMUX CODEX_BIN=/bin/echo bash "$SCRIPTS_DIR/preflight.sh" 2>&1 || true)
 contains "no TMUX → MISSING tmux-session" "MISSING: tmux-session" "$out"
+
+echo "== 9. codex capability probe (TODO #171) =="
+# Models the version split that broke this skill live: an old TUI-only codex
+# FIRST on PATH (so `command -v` picks it) and a modern exec-capable codex
+# behind it. Resolving by PATH order hands `exec.sh` a binary with no `exec`;
+# resolving by capability must reach past it. PATH is stripped to the fakes +
+# system utils so the host's real codex/npm can't leak into the assertions.
+mkdir -p "$WORK/oldbin" "$WORK/newbin"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/oldbin/codex"           # no subcommands
+printf '#!/usr/bin/env bash\n[ "$1" = exec ] && exit 0\nexit 1\n' > "$WORK/newbin/codex"
+chmod +x "$WORK/oldbin/codex" "$WORK/newbin/codex"
+
+# probe <PATH> <expr> — evaluate an expr against lib.sh under a controlled PATH
+probe() { env -u CODEX_BIN PATH="$1:/usr/bin:/bin" bash -c ". '$SCRIPTS_DIR/lib.sh'; $2" 2>/dev/null; }
+
+check "supports_exec: modern → yes" "yes" \
+  "$(probe "$WORK/newbin" 'cx_supports_exec "$(command -v codex)" && echo yes || echo no')"
+check "supports_exec: old TUI → no" "no" \
+  "$(probe "$WORK/oldbin" 'cx_supports_exec "$(command -v codex)" && echo yes || echo no')"
+
+# The regression: old codex shadows the modern one on PATH.
+check "exec_bin reaches past shadowing old codex" "$WORK/newbin/codex" \
+  "$(probe "$WORK/oldbin:$WORK/newbin" 'cx_exec_bin')"
+check "CODEX_BIN (pane transport) still binds the old one" "$WORK/oldbin/codex" \
+  "$(probe "$WORK/oldbin:$WORK/newbin" 'echo "$CODEX_BIN"')"
+
+check "exec_bin empty when nothing supports exec" "" \
+  "$(probe "$WORK/oldbin" 'cx_exec_bin')"
+check "cx_exec_bin returns 1 when none qualifies" "1" \
+  "$(probe "$WORK/oldbin" 'cx_exec_bin >/dev/null; echo $?')"
+
+# exec.sh must diagnose, not emit an opaque rc=1.
+echo "hi" > "$WORK/p.txt"
+out=$(env -u CODEX_BIN PATH="$WORK/oldbin:/usr/bin:/bin" REPO_ROOT="$WORK" \
+      bash "$SCRIPTS_DIR/exec.sh" "$WORK/p.txt" 2>&1 || true)
+contains "exec.sh → clear EXEC_FAIL" "no codex on this machine supports" "$out"
+contains "exec.sh → names the fix" "npm install -g @openai/codex@latest" "$out"
+
+# preflight REPORTS exec_bin but must not gate on it — panes need only the TUI.
+out=$(env -u CODEX_BIN PATH="$WORK/oldbin:/usr/bin:/bin" TMUX=1 REPO_ROOT="$WORK" \
+      TMUX_BIN="$FAKE_TMUX" bash "$SCRIPTS_DIR/preflight.sh" 2>&1 || true)
+contains "preflight still OK without exec" "OK: codex=" "$out"
+contains "preflight reports exec_bin=none" "exec_bin=none" "$out"
+out=$(env -u CODEX_BIN PATH="$WORK/newbin:/usr/bin:/bin" TMUX=1 REPO_ROOT="$WORK" \
+      TMUX_BIN="$FAKE_TMUX" bash "$SCRIPTS_DIR/preflight.sh" 2>&1 || true)
+contains "preflight reports exec_bin=<path>" "exec_bin=$WORK/newbin/codex" "$out"
+
+echo "== 10. exec.sh model/effort (the --exec path that bypassed the gate) =="
+# newbin/codex accepts `exec` but does nothing, so exec.sh gets far enough to
+# prove the guardrail fires BEFORE any codex is invoked.
+ex() { env -u CODEX_BIN -u TMUX PATH="$WORK/newbin:/usr/bin:/bin" REPO_ROOT="$WORK" \
+       bash "$SCRIPTS_DIR/exec.sh" "$WORK/p.txt" "$@" 2>&1; }
+
+contains "exec: bad model rejected"  "INVALID_MODEL:"  "$(ex --model gpt-5.6-sol-high)"
+contains "exec: bad effort rejected" "INVALID_EFFORT:" "$(ex --effort ultrahigh)"
+contains "exec: unknown arg rejected" "EXEC_FAIL: unknown arg" "$(ex gpt-5.6-sol)"
+contains "exec: defaults to sol/high" "MODEL=gpt-5.6-sol EFFORT=high" "$(ex)"
+contains "exec: honours overrides"    "MODEL=gpt-5.5 EFFORT=xhigh" \
+         "$(ex --model gpt-5.5 --effort xhigh)"
+
+# Lock lifetime. The gate acquires; the pane path releases in reply-validate.sh
+# (3A.3). exec has NO reply handler, so it must release itself or the next
+# invocation HOLDs for 60 min. Found live — the unit suite never ran the gate
+# and exec.sh in sequence, so an acquire with no release looked fine.
+exl() { env -u CODEX_BIN PATH="$WORK/newbin:/usr/bin:/bin" TMUX=1 REPO_ROOT="$WORK" \
+        TMUX_BIN="$FAKE_TMUX" bash "$SCRIPTS_DIR/exec.sh" "$WORK/p.txt" "$@" >/dev/null 2>&1; }
+
+freshlock; g "--exec do a thing" >/dev/null      # gate takes the lock
+[ -d "$SD/lock" ] && pass "gate holds the lock" || fail "gate did not take a lock"
+exl
+[ -d "$SD/lock" ] && fail "exec.sh leaked the gate lock (next turn would HOLD)" \
+                  || pass "exec.sh released the gate lock"
+
+freshlock; g "--exec do a thing" >/dev/null
+exl --model bogus-model-name                     # rejected before any codex call
+[ -d "$SD/lock" ] && fail "rejected exec turn still holds the lock" \
+                  || pass "rejected exec turn releases the lock"
 
 echo
 if [ "$FAILS" -eq 0 ]; then

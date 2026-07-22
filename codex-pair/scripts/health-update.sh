@@ -23,7 +23,7 @@ elif outcome in ("MISSING_TAG", "PANE_MISMATCH"):
     h["phase5_consecutive_misses"] = h.get("phase5_consecutive_misses", 0) + 1
 # LATE and MALFORMED do not increment.
 h["last_outcome"] = outcome
-h["last_outcome_ts"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+h["last_outcome_ts"] = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ")
 with open(path, "w") as f: json.dump(h, f, indent=2)
 print(h["phase5_consecutive_misses"])
 PY

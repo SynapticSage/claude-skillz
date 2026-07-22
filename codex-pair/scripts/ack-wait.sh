@@ -41,7 +41,7 @@ if "Status: OK" not in d.get("doctor_status", ""):
 # Predicate 4: ts parses and is within last 5 min
 try:
     ts = datetime.datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")
-    age = (datetime.datetime.utcnow() - ts).total_seconds()
+    age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - ts).total_seconds()
     if age > 300 or age < -60:  # tolerate small clock skew
         print(f"FAIL ts_stale age={age:.0f}s")
         sys.exit(0)

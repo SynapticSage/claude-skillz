@@ -23,6 +23,9 @@ subsequent Phase-5 dev work.
 | 5b | — | Sentinel token too long — wraps in narrow Codex panes, defeating `grep -F` | **FIXED** — sentinel is now `§cx:<8hex>:E§` (≤20 chars) |
 | 16 | HIGH | `tmux display-message -p '#{window_id}' -t "$TMUX_PANE"` arg order is wrong: `-t` after the format is parsed as a positional argument, erroring with "too many arguments". Affected ~9 bash blocks; failure was masked because errors in `$(...)` inside `set -euo pipefail` left `WINDOW_ID=""`, which then cascaded into wrong `SESSION_DIR` paths. Discovered live during /codex-pair test, 2026-04-26. | **FIXED** — every block now uses `display-message -p -t "$CC_PANE" '#{window_id}'` with the flag before the format. Documented as Invariant #10 |
 | 15 | HIGH | Bare `$TMUX_PANE` is unreliable: tmux only exports it to processes spawned directly into a pane, and CC's bash subshells inherit it inconsistently. When empty, the buggy `display-message -t ""` errored silently and the skill cascaded. Discovered live, 2026-04-26. | **FIXED** — every block now resolves `CC_PANE="${TMUX_PANE:-$($TMUX_BIN display-message -p '#{pane_id}')}"` and uses `$CC_PANE` everywhere (incl. the `cc_pane` field of pending-request JSON). Documented as Invariant #9 |
+| 17 | HIGH | Invalid model string reached the API. Three compounding holes: (a) `codex` has **no effort flag** (it rides `-c model_reasoning_effort=`) and the skill modeled no effort channel at all, so effort got smuggled into the model name (`gpt-5.6-sol-high`); (b) `--model` was free text, never validated, passed straight through; (c) `--exec` short-circuited the gate, so the model arrived at `exec.sh` as a positional the *caller typed from memory*. Discovered live, 2026-07-12. | **FIXED** — model/effort policy centralised in `lib.sh` (`CX_MODELS`/`CX_EFFORTS`/`cx_validate`/`cx_effort_conf`, new "model/effort policy" invariant); `--effort` flag added; defaults `gpt-5.6-sol`@`high` always passed explicitly; validation at the gate (pre-lock) *and* in `exec.sh`; `--exec` in tmux no longer skips the gate |
+| 19 | HIGH | **Lock leak on the exec path**, introduced by #17's own fix. Routing `--exec` through the gate (so the model gets validated) made the gate *acquire* the single-flight lock, but the lock is released in `reply-validate.sh` (3A.3) — and exec has **no reply handler**. Every `--exec` turn left the lock held, so the next `/codex-pair` in that window got `HOLD:` for the full 60-min TTL. Invisible to the unit suite, which never ran gate→exec in sequence. Caught by invoking the real skill twice, 2026-07-12. | **FIXED** — `exec.sh` releases the lock via `trap … EXIT`, so it clears on success, `EXEC_FAIL`, and `INVALID_*` alike (a failed turn must not hold it either). Pinned by gate→exec lock-lifetime tests |
+| 18 | MEDIUM | Every `exec.sh` failure surfaced as a contentless `EXEC_FAIL: … rc=1 ()`. `codex` reports API errors as `{"type":"error"}` events on **stdout** (the `--json` stream), not stderr — so `tail -1 $ERRLOG` always read an empty file. This silence is what made #17 so hard to diagnose. | **FIXED** — `exec_err()` parses the JSONL event stream for the real message and falls back to stderr. Now prints e.g. `Unsupported value: 'minimal' is not supported with the 'gpt-5.6-sol' model.` |
 
 ## Phase 5 additions landed in this iteration
 
@@ -165,10 +168,10 @@ previously had to be fixed in every block (the #15/#16 bug class).
 
 | Sev | Item | Note |
 |---|---|---|
-| LOW | `datetime.datetime.utcnow()` in `bootstrap-check.sh` / `ack-wait.sh` / `health-update.sh` is deprecated (Py 3.12+) and emits a stderr DeprecationWarning | Carried over faithfully from the inline code — NOT a regression. Replace with `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)` (stays naive-UTC, so the `strptime` comparisons keep working) when convenient |
+| LOW | `datetime.datetime.utcnow()` in `bootstrap-check.sh` / `ack-wait.sh` / `health-update.sh` is deprecated (Py 3.12+) and emits a stderr DeprecationWarning | **FIXED** (2026-07-11) — all 6 call sites (incl. both preambles + `tests/run.sh`) now use `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)`, staying naive-UTC so the `strptime` comparisons are untouched. Suite is warning-free |
 | — | **Phase 1 pane transport: LIVE-VERIFIED PASS 2026-07-08** | Full round-trip through the extracted scripts (preflight → gate → pane spawn → bracketed-paste delivery → 2-sentinel poll/extract) confirmed against the real codex TUI: prompt "what is 2+2" → extracted "4" with the completion sentinel emitted. The extraction is sound. |
 | LOW | **Phase 5 pane transport still un-live-tested** | The `tmux-bridge` MCP tools weren't loaded in the test session, so the MCP push path (3A) couldn't be exercised end to end. Run once in a session with the bridge loaded. |
-| MEDIUM | **No transport verifies the resolved `codex` supports the subcommand it needs** | Surfaced live 2026-07-08: this machine has a codex version split — `command -v codex` → `/usr/local/bin/codex` is the old 0.1.x research-preview TUI (interactive only, **no `exec`**), while the newer `@openai/codex@0.143.0` (which has `exec`) is the Homebrew npm install. So the **pane** transports work (old TUI codex), but the **exec** transport (T3-C1) would fail here because `exec.sh` calls the PATH-default codex, which lacks `exec`. Fix options: probe `codex exec --help` in preflight and pick a codex that supports it, or let the user pin `CODEX_BIN`. (T3-C1 exec was originally verified 2026-07-06 against codex 0.139.0, before this machine's install drifted.) |
+| MEDIUM | **No transport verifies the resolved `codex` supports the subcommand it needs** | **FIXED** (2026-07-11) — see "Capability-based codex resolution" below |
 
 ## Exec transport (2026-07-06, T3-C1)
 
@@ -184,3 +187,56 @@ forced with `--exec`. State in `.context/codex-pair/exec/`.
 Open: the thread-id parser keys on `thread_id` — if a future codex-cli renames
 that JSONL field, resume silently starts fresh (safe degrade, but continuity
 breaks until the parser is updated).
+
+## Capability-based codex resolution (2026-07-11)
+
+Closes the MEDIUM "no transport verifies the resolved codex" item. The root
+cause was a category error in `lib.sh`: it treated "a codex" as one capability.
+It isn't. The **pane** transports only need the interactive TUI (every codex
+major has one); the **exec** transport needs a real `codex exec` subcommand
+(only modern majors have it). One `CODEX_BIN` conflating both means the skill
+hands `exec.sh` a binary that cannot do the job, and the failure surfaces late
+as an opaque `rc=1`.
+
+- `lib.sh` gains `cx_supports_exec` (probe: `codex exec --help </dev/null`),
+  `cx_codex_candidates` (pin → **all** PATH hits via `type -aP` → npm-global
+  entrypoints), and `cx_exec_bin` (first candidate that passes the probe).
+  **The probe, not the path, is the judge** — that single rule is what makes
+  this robust to installs we haven't seen.
+- `CODEX_BIN` semantics are deliberately **unchanged** (still "first codex that
+  runs"), so the live-verified Phase 1 pane path cannot regress. A test pins
+  this invariant explicitly.
+- `exec.sh` resolves `CODEX_EXEC_BIN` and, when nothing qualifies, prints what
+  it probed + the fix instead of failing opaquely. `preflight.sh` now reports
+  `exec_bin=<path>|none` and **does not gate on it** (panes don't need `exec`).
+- Tests: `run.sh` §9, 11 assertions, incl. the exact regression — an old TUI
+  codex shadowing a modern one on PATH must still resolve to the modern one.
+
+### Environment finding — the codex install was broken, and why (REPAIRED 2026-07-11)
+
+This *corrects the 2026-07-08 row above*, which assumed the Homebrew
+`@openai/codex@0.143.0` was a usable fallback. It was not. Pre-repair state:
+
+| Path | State |
+|---|---|
+| `/usr/local/bin/codex` | Real, runs, but **0.1.2504172351** (Apr-2025 research preview) — **no `exec`**. This is what `command -v codex` resolved to. |
+| `/opt/homebrew/bin/codex` | **Dangling symlink** → `Cellar/node/25.2.1/bin/codex`, which did not exist — so `command -v` skipped it entirely. |
+| `…/node_modules/@openai/codex` | 0.143.0 package present but **broken**: threw `Missing optional dependency @openai/codex-darwin-arm64`. |
+
+**Root cause:** an orphaned npm staging dir, `@openai/.codex-tXyV4beO`, left
+behind by an install that crashed on 2026-06-12. That half-finished install is
+why the native sidecar was never fetched *and* why npm could not self-repair —
+`npm i -g` kept failing `ENOTEMPTY` trying to rename into the path its own
+orphan already occupied. Repaired by removing the orphan + package dir and
+reinstalling: now **codex-cli 0.144.1**, `command -v codex` →
+`/opt/homebrew/opt/node/bin/codex`, `exec` present. `cx_exec_bin` resolves it.
+
+**Lesson worth keeping:** a dangling bin shim is *invisible* to `command -v` —
+PATH silently skips it. That is precisely why `cx_codex_candidates` probes
+npm-global entrypoints directly rather than trusting PATH to enumerate installs.
+The fix above was written against the broken machine and is what *diagnosed* it.
+
+Remaining (not a skill bug): `codex exec` reaches the API but returns **401
+Unauthorized** — the ChatGPT session token is stale. Run `codex login` to
+refresh. Once that's done the exec transport should be live-verified end to end
+(it has never yet completed a round-trip on this machine).
