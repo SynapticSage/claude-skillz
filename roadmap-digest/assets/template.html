@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap Digest</title>
+<style>
+  :root{
+    color-scheme: light dark;
+    --surface-0:#f4f4f1; --surface-1:#fcfcfb; --surface-2:#ffffff;
+    --border:#e6e5df; --border-strong:#d3d2ca;
+    --ink:#0b0b0b; --ink-2:#52514e; --ink-3:#8a897f;
+    --accent:#2a78d6; --track:#e2e1db;
+    --st-done:#2f9e44; --st-prog:#e8930c; --st-plan:#9b9a90; --st-block:#e03131;
+    --shadow:0 1px 3px rgba(0,0,0,.07), 0 8px 26px rgba(0,0,0,.06);
+    --radius:14px;
+  }
+  @media (prefers-color-scheme: dark){ :root:where(:not([data-theme="light"])){
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#232320;
+    --border:#33332e; --border-strong:#45443d;
+    --ink:#ffffff; --ink-2:#c3c2b7; --ink-3:#8f8e82;
+    --accent:#3987e5; --track:#33332e;
+    --st-done:#37b24d; --st-prog:#f0a92a; --st-plan:#8f8e82; --st-block:#f06565;
+    --shadow:0 1px 3px rgba(0,0,0,.4), 0 8px 30px rgba(0,0,0,.35);
+  }}
+  :root[data-theme="dark"]{
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#232320;
+    --border:#33332e; --border-strong:#45443d;
+    --ink:#ffffff; --ink-2:#c3c2b7; --ink-3:#8f8e82;
+    --accent:#3987e5; --track:#33332e;
+    --st-done:#37b24d; --st-prog:#f0a92a; --st-plan:#8f8e82; --st-block:#f06565;
+    --shadow:0 1px 3px rgba(0,0,0,.4), 0 8px 30px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface-0);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1060px;margin:0 auto;padding:26px 20px 72px}
+  a{color:var(--accent)}
+
+  /* header */
+  .head{display:flex;gap:26px;align-items:center;flex-wrap:wrap;
+    background:var(--surface-1);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:20px 22px}
+  .head .txt{flex:1 1 320px;min-width:0}
+  .head h1{margin:0 0 3px;font-size:24px;letter-spacing:-.01em}
+  .head .meta{color:var(--ink-3);font-size:13px;margin-bottom:8px}
+  .head .summary{color:var(--ink-2);max-width:60ch}
+  .ring{width:132px;height:132px;flex:0 0 auto}
+  .ring .track{fill:none;stroke:var(--track);stroke-width:11}
+  .ring .arc{fill:none;stroke-width:11;transform:rotate(-90deg);transform-origin:center}
+  .ring .arc.done{stroke:var(--st-done)}
+  .ring .arc.prog{stroke:var(--st-prog)}
+  .ring .big{font-size:26px;font-weight:700;fill:var(--ink);font-variant-numeric:tabular-nums}
+  .ring .sub{font-size:9.5px;fill:var(--ink-3);text-transform:uppercase;letter-spacing:.08em}
+
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:14px 2px 2px}
+  .legend .li{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2)}
+  .dotico{font-weight:700;font-size:13px;width:16px;text-align:center}
+
+  /* phase grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin-top:16px}
+  .card{background:var(--surface-1);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:15px 16px}
+  .card h3{margin:0 0 8px;font-size:15px;display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+  .card h3 .cnt{color:var(--ink-3);font-size:12.5px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pbar{height:7px;border-radius:5px;background:var(--track);display:flex;overflow:hidden;margin-bottom:12px}
+  .pbar i{display:block;height:100%}
+  .pbar .d{background:var(--st-done)} .pbar .p{background:var(--st-prog)} .pbar .b{background:var(--st-block)}
+  .item{display:flex;align-items:baseline;gap:8px;padding:5px 0 5px 10px;border-left:3px solid var(--st-plan);
+    margin:3px 0}
+  .item.done{border-color:var(--st-done)} .item.in-progress{border-color:var(--st-prog)}
+  .item.planned{border-color:var(--st-plan)} .item.blocked{border-color:var(--st-block)}
+  .item .ic{flex:0 0 auto;font-weight:700;font-size:12px;width:14px;text-align:center}
+  .item.done .ic{color:var(--st-done)} .item.in-progress .ic{color:var(--st-prog)}
+  .item.planned .ic{color:var(--st-plan)} .item.blocked .ic{color:var(--st-block)}
+  .item .t{font-weight:560;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto;max-width:100%}
+  .item .why{color:var(--ink-3);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
+  details.item{display:block;border-left:3px solid var(--st-plan);cursor:pointer}
+  details.item summary{display:flex;align-items:baseline;gap:8px;list-style:none}
+  details.item summary::-webkit-details-marker{display:none}
+  details .exp{margin:6px 0 4px 22px;color:var(--ink-2);font-size:13px}
+  details .exp .ev{color:var(--ink-3);font-size:12px;margin-top:2px}
+
+  /* strips */
+  section.block{margin-top:26px}
+  section.block h2{font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink-3);margin:0 0 10px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-1);border:1px solid var(--border);
+    border-radius:20px;padding:5px 12px;font-size:13px}
+  .chip .ic{color:var(--st-done);font-weight:700}
+  .chip .when{color:var(--ink-3);font-size:11.5px}
+  ol.next{margin:0;padding:0;list-style:none;counter-reset:n}
+  ol.next li{counter-increment:n;display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--border)}
+  ol.next li:first-child{border-top:0}
+  ol.next li::before{content:counter(n);flex:0 0 22px;height:22px;border-radius:50%;background:var(--surface-2);
+    border:1px solid var(--border-strong);color:var(--ink-2);font-size:12px;display:grid;place-items:center;font-variant-numeric:tabular-nums}
+  ol.next .t{font-weight:560} ol.next .why{color:var(--ink-3);font-size:13px}
+
+  /* narrative */
+  .narr section{margin-top:22px}
+  .narr h2{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+  .narr ul{margin:0;padding-left:2px;list-style:none}
+  .narr li{padding:4px 0 4px 22px;position:relative;color:var(--ink-2)}
+  .narr li .b{position:absolute;left:2px;top:4px;font-weight:700}
+  .narr .lead{color:var(--ink-2);font-size:16px;max-width:64ch}
+
+  /* blockers — a prominent, examinable section rendered only when items are blocked */
+  section.blockers{margin-top:20px;background:var(--surface-1);border:1px solid var(--st-block);
+    border-left:4px solid var(--st-block);border-radius:var(--radius);box-shadow:var(--shadow);padding:15px 18px}
+  section.blockers h2{font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--st-block);
+    margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .blk{padding:11px 0;border-top:1px solid var(--border)}
+  .blk:first-of-type{border-top:0;padding-top:2px}
+  .blk .bt{font-weight:640;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .blk .bt .ic{color:var(--st-block);font-weight:700;flex:0 0 auto}
+  .blk .bt .ph{color:var(--ink-3);font-size:12px;font-weight:500;margin-left:auto;white-space:nowrap}
+  .blk .bd{color:var(--ink-2);font-size:13.5px;line-height:1.5;margin:5px 0 0 22px;max-width:78ch}
+  .blk .ask{margin:7px 0 0 22px;font-size:13px;color:var(--ink);background:var(--surface-2);
+    border:1px solid var(--border);border-radius:8px;padding:6px 11px;display:inline-block;max-width:78ch}
+  .blk .ask .lbl{color:var(--st-block);font-weight:640}
+  .blk .bev{color:var(--ink-3);font-size:12px;margin:5px 0 0 22px;font-variant-numeric:tabular-nums}
+
+  .themebtn{position:fixed;top:14px;right:16px;background:var(--surface-2);border:1px solid var(--border-strong);
+    color:var(--ink-2);border-radius:9px;padding:6px 10px;font:inherit;font-size:12.5px;cursor:pointer;box-shadow:var(--shadow)}
+  .foot{margin-top:26px;color:var(--ink-3);font-size:12px}
+</style>
+</head>
+<body>
+<button class="themebtn" id="themebtn">◐ Theme</button>
+<div class="wrap"><div id="app"></div>
+  <p class="foot" id="foot"></p>
+</div>
+<script>
+const DATA = __DATA__;
+
+const STATUS = {
+  'done':        {icon:'✓', word:'done'},
+  'in-progress': {icon:'◐', word:'in progress'},
+  'planned':     {icon:'○', word:'planned'},
+  'blocked':     {icon:'▲', word:'blocked'},
+};
+const esc = s => String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const items = () => (DATA.phases||[]).flatMap(p=>p.items||[]);
+const byStatus = st => items().filter(i=>i.status===st);
+
+function rollup(){
+  const all = items(); const c={done:0,'in-progress':0,planned:0,blocked:0};
+  all.forEach(i=>{ c[i.status]=(c[i.status]||0)+1; });
+  const total = all.length||1;
+  return {all,c,total,pct:Math.round(c.done/total*100),
+    doneP:c.done/total*100, progP:c['in-progress']/total*100, blockP:c.blocked/total*100};
+}
+function phaseRoll(p){
+  const it=p.items||[]; const c={done:0,'in-progress':0,planned:0,blocked:0};
+  it.forEach(i=>{ c[i.status]=(c[i.status]||0)+1; });
+  const t=it.length||1;
+  return {c,t:it.length,doneP:c.done/t*100,progP:c['in-progress']/t*100,blockP:c.blocked/t*100};
+}
+
+function ring(r){
+  const dP=r.doneP.toFixed(2), pP=r.progP.toFixed(2), off=(-r.doneP).toFixed(2);
+  return `<svg class="ring" viewBox="0 0 120 120" role="img" aria-label="${r.pct}% done">
+    <circle class="track" cx="60" cy="60" r="52" pathLength="100"></circle>
+    <circle class="arc done" cx="60" cy="60" r="52" pathLength="100" stroke-dasharray="${dP} ${(100-dP).toFixed(2)}"></circle>
+    <circle class="arc prog" cx="60" cy="60" r="52" pathLength="100" stroke-dasharray="${pP} ${(100-pP).toFixed(2)}" stroke-dashoffset="${off}"></circle>
+    <text class="big" x="60" y="58" text-anchor="middle" dominant-baseline="middle">${r.pct}%</text>
+    <text class="sub" x="60" y="76" text-anchor="middle">${r.c.done}/${r.total} done</text>
+  </svg>`;
+}
+function legend(r){
+  const order=['done','in-progress','planned','blocked'];
+  return `<div class="legend">`+order.filter(s=>r.c[s]>0).map(s=>{
+    const m=STATUS[s];
+    return `<span class="li"><span class="dotico" style="color:var(--st-${s==='in-progress'?'prog':s==='blocked'?'block':s==='planned'?'plan':'done'})">${m.icon}</span>${m.word} · ${r.c[s]}</span>`;
+  }).join('')+`</div>`;
+}
+function header(r){
+  const blk = r.c.blocked ? ` · <span style="color:var(--st-block)">${r.c.blocked} blocked</span>` : '';
+  return `<div class="head">${ring(r)}
+    <div class="txt"><h1>${esc(DATA.project||'Roadmap')}</h1>
+      <div class="meta">Updated ${esc(DATA.generated||'')} · ${r.total} items${blk}</div>
+      <div class="summary">${esc(DATA.summary||'')}</div>
+      ${legend(r)}
+    </div></div>`;
+}
+
+function itemRow(i, expand){
+  const m=STATUS[i.status]||STATUS.planned;
+  if(expand){
+    return `<details class="item ${i.status}"><summary><span class="ic">${m.icon}</span>`
+      +`<span class="t">${esc(i.title)}</span><span class="why">${esc(i.why||'')}</span></summary>`
+      +`<div class="exp">${esc(i.why||'')}${i.evidence?`<div class="ev">${esc(i.evidence)}</div>`:''}</div></details>`;
+  }
+  return `<div class="item ${i.status}"><span class="ic">${m.icon}</span>`
+    +`<span class="t">${esc(i.title)}</span><span class="why">${esc(i.why||'')}</span></div>`;
+}
+function phaseCard(p, expand){
+  const pr=phaseRoll(p);
+  const bar=`<div class="pbar" role="img" aria-label="${pr.c.done} of ${pr.t} done">
+    <i class="d" style="width:${pr.doneP}%"></i><i class="p" style="width:${pr.progP}%"></i><i class="b" style="width:${pr.blockP}%"></i></div>`;
+  return `<div class="card"><h3><span>${esc(p.name||'Phase')}</span><span class="cnt">${pr.c.done}/${pr.t}</span></h3>
+    ${bar}${(p.items||[]).map(i=>itemRow(i,expand)).join('')}</div>`;
+}
+function grid(expand){ return `<div class="grid">${(DATA.phases||[]).map(p=>phaseCard(p,expand)).join('')}</div>`; }
+
+function shippedStrip(){
+  let list = DATA.shipped;
+  if(!list){ list = byStatus('done').map(i=>({title:i.title, when:(String(i.evidence||'').match(/\d{4}-\d{2}-\d{2}/)||[''])[0]})); }
+  if(!list.length) return '';
+  return `<section class="block"><h2>Recently shipped</h2><div class="chips">`
+    + list.slice(0,12).map(s=>`<span class="chip"><span class="ic">✓</span>${esc(s.title)}${s.when?`<span class="when">${esc(s.when)}</span>`:''}</span>`).join('')
+    + `</div></section>`;
+}
+function nextList(){
+  let list = DATA.next;
+  if(!list){ list = [...byStatus('in-progress'),...byStatus('blocked'),...byStatus('planned')].map(i=>({title:i.title,why:i.why})); }
+  if(!list.length) return '';
+  return `<section class="block"><h2>Next up</h2><ol class="next">`
+    + list.slice(0,8).map(n=>`<li><div><span class="t">${esc(n.title)}</span>${n.why?` <span class="why">— ${esc(n.why)}</span>`:''}</div></li>`).join('')
+    + `</ol></section>`;
+}
+
+function narrative(r){
+  const grp = st => (DATA.phases||[]).map(p=>({name:p.name,its:(p.items||[]).filter(i=>i.status===st)})).filter(g=>g.its.length);
+  const bullets = st => grp(st).map(g=>
+    `<li><span class="b" style="color:var(--st-${st==='in-progress'?'prog':st==='blocked'?'block':st==='planned'?'plan':'done'})">${STATUS[st].icon}</span>`
+    +`<strong>${esc(g.name)}:</strong> ${g.its.map(i=>esc(i.title)).join(' · ')}</li>`).join('') || '<li><span class="b">·</span>—</li>';
+  const nextL = (DATA.next || [...byStatus('in-progress'),...byStatus('planned')].map(i=>({title:i.title,why:i.why})))
+    .slice(0,8).map(n=>`<li><span class="b">→</span>${esc(n.title)}${n.why?` — <span style="color:var(--ink-3)">${esc(n.why)}</span>`:''}</li>`).join('');
+  const risks = (DATA.risks||[]).map(x=>`<li><span class="b" style="color:var(--st-block)">▲</span>${esc(x)}</li>`).join('');
+  return `<div class="narr">
+    <section><h2>${STATUS.done.icon} Shipped</h2><ul>${bullets('done')}</ul></section>
+    ${r.c['in-progress']?`<section><h2>${STATUS['in-progress'].icon} In flight</h2><ul>${bullets('in-progress')}</ul></section>`:''}
+    <section><h2>→ Up next</h2><ul>${nextL||'<li><span class="b">·</span>—</li>'}</ul></section>
+    ${risks?`<section><h2 style="color:var(--st-block)">▲ Risks</h2><ul>${risks}</ul></section>`:''}
+  </div>`;
+}
+
+// The human's decision queue: every blocked item, surfaced at the FOOT of the document
+// with enough to act on — the phase it sits in, what's stalled (`detail`, falling back to
+// `why`), the specific approval/decision that unblocks it (`ask`), and the `evidence` trail.
+// Placed last on purpose: the reader absorbs the progress story, then lands on exactly
+// "what do you need from me?" Hidden entirely when nothing is blocked.
+function blockersSection(){
+  const blk = (DATA.phases||[]).flatMap(p=>(p.items||[])
+    .filter(i=>i.status==='blocked').map(i=>({item:i, phase:p.name})));
+  if(!blk.length) return '';
+  return `<section class="blockers"><h2>▲ Blockers — awaiting your decision · ${blk.length}</h2>`
+    + blk.map(({item:b,phase})=>`<div class="blk"><div class="bt"><span class="ic">▲</span>`
+      +`<span>${esc(b.title)}</span><span class="ph">${esc(phase||'')}</span></div>`
+      +`<div class="bd">${esc(b.detail||b.why||'—')}</div>`
+      +(b.ask?`<div class="ask"><span class="lbl">Needs your call:</span> ${esc(b.ask)}</div>`:'')
+      +(b.evidence?`<div class="bev">${esc(b.evidence)}</div>`:'')
+      +`</div>`).join('')
+    + `</section>`;
+}
+
+function render(){
+  const r=rollup(); const style=DATA.style||'dashboard';
+  let body;
+  if(style==='narrative') body = narrative(r);
+  else if(style==='detailed') body = grid(true)+shippedStrip()+nextList();
+  else body = grid(false)+shippedStrip()+nextList();
+  document.getElementById('app').innerHTML = header(r)+body+blockersSection();
+  document.getElementById('foot').textContent =
+    `Generated companion view — regenerate from the roadmap; do not hand-edit. Style: ${style}.`;
+}
+
+document.getElementById('themebtn').addEventListener('click',()=>{
+  const cur=document.documentElement.dataset.theme||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+  document.documentElement.dataset.theme = cur==='dark'?'light':'dark';
+});
+render();
+</script>
+</body>
+</html>
