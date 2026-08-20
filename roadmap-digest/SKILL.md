@@ -80,10 +80,14 @@ of `references/extraction.md`. Keep each item's `why` to one line — the digest
 compression. Don't compute percentages yourself; the template does that from your statuses (so
 the arithmetic can't drift from the counts on screen).
 
-For any `blocked` item, also fill `detail` (what's stalled) and `ask` (the specific approval or
-decision that unblocks it). The template collects these into a **"Blockers — awaiting your
-decision"** queue at the foot of the page, so this is where you make the roadmap *actionable*
-for the human: name the decision they owe, not just the fact that something is stuck.
+Blocked items deserve the most care. The template collects every `blocked` item into a
+**"Blockers — awaiting your decision"** queue at the foot of the page — the one section that
+trades brevity for depth. Fill each blocker so a **programmer who has never seen this roadmap can
+get up to speed on it from that section alone**, assuming no tribal knowledge: `context` (what the
+area is and why it exists), `detail` (what's stalled), `options` (the paths being weighed, each
+with its tradeoff), `ask` (the decision you owe), `touches` (the files/modules/refs a coder would
+open), and `evidence`. This is where you make the roadmap *actionable* for both the decider and
+whoever implements the unblock. See `references/extraction.md` for the field spec and a worked example.
 
 ### 3 — Render
 
@@ -116,7 +120,8 @@ These are the standards the output is judged against — hold to them over any i
   must read the same story. The template already does this; don't defeat it.
 - **Compress ruthlessly.** One line of *why* per item, not a paragraph. If the roadmap has 60
   items, group aggressively by phase/theme; a wall of 60 chips is not digestible. Prefer showing
-  the shape (how much of each phase is done) over enumerating everything.
+  the shape (how much of each phase is done) over enumerating everything. **The blockers queue at
+  the foot is the deliberate exception** — it is meant to be a full, cold-start briefing (see step 2).
 - **Truth over polish.** Half-done is `in progress`, not `done`. An item you can't corroborate
   is `planned`, not `done`. The digest earns trust by matching reality, including its ragged edges.
 ```

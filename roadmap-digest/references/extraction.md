@@ -45,23 +45,43 @@ Rules that keep the output honest and small:
   driftable source of truth.
 - **`evidence`** is a short, human-readable trail (a journal date, a commit sha, a PR number),
   not a URL dump. It's what lets a reader trust a "done".
-- **`detail`** (optional, most useful on `blocked` items) — a 1–3 sentence expansion of what is
-  stalled and why.
-- **`ask`** (optional, `blocked` items) — the specific approval or decision the human must make
-  to unblock it, in one line ("approve PagerDuty vs Opsgenie", "sign off on the schema change").
-  The template gathers every `blocked` item into an **"▲ Blockers — awaiting your decision"**
-  section at the **foot of the document** — a human decision queue — rendering each blocker's
-  `detail` (falling back to `why`), its `ask` as a "Needs your call" callout, and its `evidence`.
-  It's placed last on purpose: the reader absorbs the progress story, then lands on exactly what
-  you need from them. Write blocked items so that reads clearly — name the *decision*, not just the
-  fact that something is stuck. Example of a blocked item that reads as a clean ask:
+### Blocked items get a full briefing
+
+The template gathers every `blocked` item into an **"▲ Blockers — awaiting your decision"**
+section at the **foot of the document** — a human decision queue, placed last on purpose so the
+reader absorbs the progress story and then lands on exactly what's needed from them. This is the
+one place the digest **trades brevity for depth**: write each blocker so a **programmer who has
+never seen this roadmap can get up to speed on it from this section alone** — assume no tribal
+knowledge. These fields (all optional; supply as many as apply) build that briefing:
+
+- **`context`** — 1–3 sentences of background: what this feature/area *is*, why it exists, and what
+  it connects to. The onboarding hook for someone who doesn't know the domain.
+- **`detail`** — what specifically is stalled and the current state (what's built, what isn't).
+  Falls back to `why` if omitted. Rendered as "Stalled on …".
+- **`options`** — for a *decision* blocker, the paths being weighed. Array of
+  `{ "name": "...", "tradeoff": "..." }` (or plain strings). Give the tradeoff, not just the name,
+  so the decision-maker sees the shape of the call.
+- **`ask`** — the one-line approval/decision that unblocks it ("approve flat vs. inherited roles").
+  Rendered as a red **"Needs your call"** callout.
+- **`touches`** — array of strings naming the files / modules / services / refs a coder would open
+  to work this (`["auth/rbac.py", "migrations/", "PR #142"]`). Rendered as code chips — "where to look".
+- **`evidence`** — the corroborating trail (PR, RFC, journal date).
+
+Only `title` + `status` are required; the more briefing fields you fill, the more self-contained
+the blocker. A worked example that a stranger to the project could act on:
 
   ```jsonc
-  { "title": "Alerting", "status": "blocked",
-    "why": "waiting on on-call tooling decision",
-    "detail": "Alerting can't ship until we choose PagerDuty vs Opsgenie; both integrations are spec'd.",
-    "ask": "approve PagerDuty vs Opsgenie so alerting can proceed",
-    "evidence": "RFC #58" }
+  { "title": "Auth: RBAC roles", "status": "blocked",
+    "why": "role model undecided",
+    "context": "RBAC gates every API route by user role. It is the last piece before Phase 1 signoff, and downstream services already assume it exists.",
+    "detail": "The enforcement middleware is coded behind a feature flag, but the role hierarchy itself is unsettled, so we can't seed real roles or write the migration.",
+    "options": [
+      { "name": "Flat roles", "tradeoff": "simple to ship and reason about; no inheritance means more per-route grants later" },
+      { "name": "Inherited groups", "tradeoff": "models orgs cleanly and scales; more upfront schema and a thornier permission-resolution path" }
+    ],
+    "ask": "approve flat roles vs. inherited groups for RBAC",
+    "touches": ["auth/rbac.py", "auth/middleware.py", "migrations/", "RFC #51", "PR #142"],
+    "evidence": "PR #142 open · RFC #51" }
   ```
 
 ## Status taxonomy

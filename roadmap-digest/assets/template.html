@@ -115,11 +115,27 @@
   .blk .bt{font-weight:640;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
   .blk .bt .ic{color:var(--st-block);font-weight:700;flex:0 0 auto}
   .blk .bt .ph{color:var(--ink-3);font-size:12px;font-weight:500;margin-left:auto;white-space:nowrap}
-  .blk .bd{color:var(--ink-2);font-size:13.5px;line-height:1.5;margin:5px 0 0 22px;max-width:78ch}
-  .blk .ask{margin:7px 0 0 22px;font-size:13px;color:var(--ink);background:var(--surface-2);
-    border:1px solid var(--border);border-radius:8px;padding:6px 11px;display:inline-block;max-width:78ch}
+  .blk .row{color:var(--ink-2);font-size:13.5px;line-height:1.5;margin:6px 0 0 22px;max-width:80ch}
+  .blk .row .lbl{color:var(--ink-3);font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;margin-right:7px}
+  .blk .ctx{color:var(--ink-2)}
+  .blk .opts{margin:7px 0 0 22px;padding:0;list-style:none;max-width:80ch}
+  .blk .opts li{position:relative;padding:3px 0 3px 16px;color:var(--ink-2);font-size:13px;line-height:1.5}
+  .blk .opts li::before{content:'▸';position:absolute;left:0;color:var(--ink-3)}
+  .blk .opts .on{font-weight:640;color:var(--ink)}
+  .blk .ask{margin:8px 0 0 22px;font-size:13px;color:var(--ink);background:var(--surface-2);
+    border:1px solid var(--border);border-radius:8px;padding:6px 11px;display:inline-block;max-width:80ch}
   .blk .ask .lbl{color:var(--st-block);font-weight:640}
-  .blk .bev{color:var(--ink-3);font-size:12px;margin:5px 0 0 22px;font-variant-numeric:tabular-nums}
+  .blk .touches{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0 22px;align-items:center}
+  .blk .touches .lbl{color:var(--ink-3);font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}
+  .blk .touches code{background:var(--surface-2);border:1px solid var(--border);border-radius:6px;
+    padding:2px 7px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .blk .bev{color:var(--ink-3);font-size:12px;margin:8px 0 0 22px;font-variant-numeric:tabular-nums}
+  /* per-source proposal blocks (optional b.proposals[]) — two independent takes side by side */
+  .blk .prop{margin:9px 0 0 22px;padding:7px 0 3px 12px;border-left:2px solid var(--border-strong);max-width:80ch}
+  .blk .prop .psrc{font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);margin-bottom:1px}
+  .blk .prop .opts{margin-top:3px}
+  .blk .prop .prec{margin-top:5px;font-size:13px;color:var(--ink);line-height:1.5}
+  .blk .prop .prec .lbl{color:var(--st-done);font-weight:700;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;margin-right:7px}
 
   .themebtn{position:fixed;top:14px;right:16px;background:var(--surface-2);border:1px solid var(--border-strong);
     color:var(--ink-2);border-radius:9px;padding:6px 10px;font:inherit;font-size:12.5px;cursor:pointer;box-shadow:var(--shadow)}
@@ -237,20 +253,36 @@ function narrative(r){
   </div>`;
 }
 
-// The human's decision queue: every blocked item, surfaced at the FOOT of the document
-// with enough to act on — the phase it sits in, what's stalled (`detail`, falling back to
-// `why`), the specific approval/decision that unblocks it (`ask`), and the `evidence` trail.
-// Placed last on purpose: the reader absorbs the progress story, then lands on exactly
-// "what do you need from me?" Hidden entirely when nothing is blocked.
+// The human's decision queue, and a cold-start briefing for whoever picks the blocker up.
+// Every blocked item is surfaced at the FOOT of the document as a self-contained brief — enough
+// that a coder who has never seen this roadmap gets up to speed from this section alone:
+//   context  — what the area is / why it exists (no tribal knowledge assumed)
+//   detail   — what's stalled and the current state
+//   options  — the paths being weighed, each with its tradeoff (decision blockers)
+//   ask      — the one-line approval/decision that unblocks it ("Needs your call")
+//   touches  — the files/modules/refs a coder would open, as code chips
+//   evidence — the corroborating trail
+// Placed last on purpose: the reader absorbs the progress story, then lands on exactly what's
+// needed from them. This is the one section that trades brevity for depth. Hidden when nothing is blocked.
 function blockersSection(){
   const blk = (DATA.phases||[]).flatMap(p=>(p.items||[])
     .filter(i=>i.status==='blocked').map(i=>({item:i, phase:p.name})));
   if(!blk.length) return '';
+  const opt = o => typeof o==='string' ? esc(o)
+    : `<span class="on">${esc(o.name||'')}</span>${o.tradeoff?` — ${esc(o.tradeoff)}`:''}`;
   return `<section class="blockers"><h2>▲ Blockers — awaiting your decision · ${blk.length}</h2>`
-    + blk.map(({item:b,phase})=>`<div class="blk"><div class="bt"><span class="ic">▲</span>`
-      +`<span>${esc(b.title)}</span><span class="ph">${esc(phase||'')}</span></div>`
-      +`<div class="bd">${esc(b.detail||b.why||'—')}</div>`
+    + blk.map(({item:b,phase})=>`<div class="blk">`
+      +`<div class="bt"><span class="ic">▲</span><span>${esc(b.title)}</span><span class="ph">${esc(phase||'')}</span></div>`
+      +(b.context?`<div class="row ctx">${esc(b.context)}</div>`:'')
+      +`<div class="row"><span class="lbl">Stalled on</span>${esc(b.detail||b.why||'—')}</div>`
+      +(Array.isArray(b.options)&&b.options.length?`<ul class="opts">${b.options.map(o=>`<li>${opt(o)}</li>`).join('')}</ul>`:'')
+      +(Array.isArray(b.proposals)&&b.proposals.length?b.proposals.map(pr=>`<div class="prop">`
+        +`<div class="psrc">${esc(pr.source||'')}</div>`
+        +(Array.isArray(pr.options)&&pr.options.length?`<ul class="opts">${pr.options.map(o=>`<li>${opt(o)}</li>`).join('')}</ul>`:'')
+        +(pr.recommend?`<div class="prec"><span class="lbl">Recommends</span>${esc(pr.recommend)}</div>`:'')
+        +`</div>`).join(''):'')
       +(b.ask?`<div class="ask"><span class="lbl">Needs your call:</span> ${esc(b.ask)}</div>`:'')
+      +(Array.isArray(b.touches)&&b.touches.length?`<div class="touches"><span class="lbl">Touches</span>${b.touches.map(t=>`<code>${esc(t)}</code>`).join('')}</div>`:'')
       +(b.evidence?`<div class="bev">${esc(b.evidence)}</div>`:'')
       +`</div>`).join('')
     + `</section>`;
